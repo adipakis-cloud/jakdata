@@ -1,16 +1,19 @@
 """
 JAKDATA - Aplikasi Pendataan Warga DKI Jakarta
 Sistem Monitoring Kinerja Tim Koordinator Lapangan
+Versi 2.0 - PostgreSQL + Enkripsi Data
 """
 
 import streamlit as st
-import sqlite3
 import pandas as pd
 import hashlib
-import json
 import re
 from datetime import datetime
 import io
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from cryptography.fernet import Fernet
+import os
 
 # ============================================================
 # KONFIGURASI HALAMAN
@@ -388,71 +391,161 @@ WILAYAH_DKI = {
 
 
 # ============================================================
-# DATABASE SETUP
+# ENKRIPSI DATA (UU PDP Compliant)
 # ============================================================
+def get_cipher():
+    """Ambil cipher untuk enkripsi/dekripsi data sensitif"""
+    try:
+        key = st.secrets.get("ENCRYPT_KEY", None)
+        if key:
+            return Fernet(key.encode())
+    except:
+        pass
+    # Fallback: generate key dari DATABASE_URL (konsisten)
+    try:
+        db_url = st.secrets["DATABASE_URL"]
+        seed = hashlib.sha256(db_url.encode()).digest()
+        key = base64.urlsafe_b64encode(seed)
+        return Fernet(key)
+    except:
+        return None
+
+def encrypt_data(data: str) -> str:
+    """Enkripsi data sensitif"""
+    if not data:
+        return data
+    try:
+        cipher = get_cipher()
+        if cipher:
+            return cipher.encrypt(data.encode()).decode()
+    except:
+        pass
+    return data
+
+def decrypt_data(data: str) -> str:
+    """Dekripsi data sensitif"""
+    if not data:
+        return data
+    try:
+        cipher = get_cipher()
+        if cipher:
+            return cipher.decrypt(data.encode()).decode()
+    except:
+        pass
+    return data
+
+# ============================================================
+# DATABASE SETUP — PostgreSQL
+# ============================================================
+@st.cache_resource
+def get_db_connection():
+    """Koneksi PostgreSQL via Supabase"""
+    try:
+        db_url = st.secrets["DATABASE_URL"]
+        conn = psycopg2.connect(db_url, cursor_factory=RealDictCursor)
+        conn.autocommit = False
+        return conn
+    except Exception as e:
+        st.error(f"❌ Gagal koneksi database: {str(e)}")
+        return None
+
 def get_db():
-    conn = sqlite3.connect("jakdata.db", check_same_thread=False)
-    conn.row_factory = sqlite3.Row
+    """Dapatkan koneksi database yang aktif"""
+    conn = get_db_connection()
+    if conn:
+        try:
+            # Test koneksi masih aktif
+            conn.cursor().execute("SELECT 1")
+        except:
+            # Reset jika koneksi mati
+            st.cache_resource.clear()
+            conn = get_db_connection()
     return conn
 
-def init_db():
+def run_query(query, params=None, fetch=True):
+    """Jalankan query dengan error handling"""
     conn = get_db()
-    c = conn.cursor()
+    if not conn:
+        return [] if fetch else False
+    try:
+        cur = conn.cursor()
+        cur.execute(query, params or ())
+        if fetch:
+            result = cur.fetchall()
+            return [dict(row) for row in result]
+        else:
+            conn.commit()
+            return True
+    except Exception as e:
+        conn.rollback()
+        st.error(f"❌ Database error: {str(e)}")
+        return [] if fetch else False
 
-    # Tabel akun pengguna/tim
-    c.execute("""
+def run_query_one(query, params=None):
+    """Jalankan query dan ambil satu baris"""
+    result = run_query(query, params, fetch=True)
+    return result[0] if result else None
+
+def init_db():
+    """Inisialisasi tabel PostgreSQL"""
+    conn = get_db()
+    if not conn:
+        return
+
+    cur = conn.cursor()
+
+    # Tabel users
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password TEXT NOT NULL,
-            nama_lengkap TEXT NOT NULL,
-            role TEXT NOT NULL,
-            kota TEXT,
-            kecamatan TEXT,
-            kelurahan TEXT,
-            rw TEXT,
-            created_at TEXT DEFAULT (datetime('now','localtime')),
+            id SERIAL PRIMARY KEY,
+            username VARCHAR(100) UNIQUE NOT NULL,
+            password VARCHAR(255) NOT NULL,
+            nama_lengkap VARCHAR(255) NOT NULL,
+            role VARCHAR(50) NOT NULL,
+            kota VARCHAR(100),
+            kecamatan VARCHAR(100),
+            kelurahan VARCHAR(100),
+            rw VARCHAR(20),
+            created_at TIMESTAMP DEFAULT NOW(),
             is_active INTEGER DEFAULT 1
         )
     """)
 
-    # Tabel data warga
-    c.execute("""
+    # Tabel warga
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS warga (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            nama_lengkap TEXT NOT NULL,
-            nik TEXT UNIQUE NOT NULL,
-            no_telepon TEXT,
+            id SERIAL PRIMARY KEY,
+            nama_lengkap VARCHAR(255) NOT NULL,
+            nik VARCHAR(512) UNIQUE NOT NULL,
+            no_telepon VARCHAR(512),
             alamat TEXT,
-            kota TEXT,
-            kecamatan TEXT,
-            kelurahan TEXT,
+            kota VARCHAR(100),
+            kecamatan VARCHAR(100),
+            kelurahan VARCHAR(100),
             rw INTEGER,
             rt INTEGER,
-            latitude REAL,
-            longitude REAL,
-            diinput_oleh TEXT,
-            diinput_nama TEXT,
-            role_input TEXT,
-            kota_petugas TEXT,
-            kecamatan_petugas TEXT,
-            kelurahan_petugas TEXT,
-            created_at TEXT DEFAULT (datetime('now','localtime'))
+            latitude DOUBLE PRECISION,
+            longitude DOUBLE PRECISION,
+            diinput_oleh VARCHAR(100),
+            diinput_nama VARCHAR(255),
+            role_input VARCHAR(50),
+            kota_petugas VARCHAR(100),
+            kecamatan_petugas VARCHAR(100),
+            kelurahan_petugas VARCHAR(100),
+            created_at TIMESTAMP DEFAULT NOW()
         )
     """)
 
-    # Buat akun admin default jika belum ada
+    # Admin default
     admin_password = hash_password("admin123")
-    try:
-        c.execute("""
-            INSERT OR IGNORE INTO users (username, password, nama_lengkap, role)
-            VALUES (?, ?, ?, ?)
-        """, ("admin", admin_password, "Administrator Provinsi DKI Jakarta", "Admin"))
-    except:
-        pass
+    cur.execute("""
+        INSERT INTO users (username, password, nama_lengkap, role)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (username) DO NOTHING
+    """, ("admin", admin_password,
+          "Administrator Provinsi DKI Jakarta", "Admin"))
 
     conn.commit()
-    conn.close()
 
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
@@ -461,13 +554,12 @@ def hash_password(password):
 # FUNGSI AUTENTIKASI
 # ============================================================
 def login(username, password):
-    conn = get_db()
-    c = conn.cursor()
     hashed = hash_password(password)
-    c.execute("SELECT * FROM users WHERE username=? AND password=? AND is_active=1", (username, hashed))
-    user = c.fetchone()
-    conn.close()
-    return dict(user) if user else None
+    user = run_query_one(
+        "SELECT * FROM users WHERE username=%s AND password=%s AND is_active=1",
+        (username, hashed)
+    )
+    return user
 
 def logout():
     for key in ["user", "page"]:
@@ -592,50 +684,61 @@ def page_dashboard():
     </div>
     """, unsafe_allow_html=True)
 
-    conn = get_db()
-
     # --- QUERY berdasarkan role ---
     if role == "Admin":
-        total_warga = pd.read_sql("SELECT COUNT(*) as total FROM warga", conn).iloc[0, 0]
-        total_koordinator = pd.read_sql("SELECT COUNT(*) as total FROM users WHERE role != 'Admin' AND is_active=1", conn).iloc[0, 0]
-        total_korwil = pd.read_sql("SELECT COUNT(*) as total FROM users WHERE role='Korwil' AND is_active=1", conn).iloc[0, 0]
-        total_korcam = pd.read_sql("SELECT COUNT(*) as total FROM users WHERE role='Korcam' AND is_active=1", conn).iloc[0, 0]
-        df_kota = pd.read_sql("SELECT kota, COUNT(*) as jumlah FROM warga GROUP BY kota ORDER BY jumlah DESC", conn)
-        df_kecamatan = pd.read_sql("SELECT kecamatan, COUNT(*) as jumlah FROM warga GROUP BY kecamatan ORDER BY jumlah DESC LIMIT 15", conn)
-        df_korwil_perf = pd.read_sql("""
+        r = run_query_one("SELECT COUNT(*) as total FROM warga")
+        total_warga = r["count"] if r else 0
+        r = run_query_one("SELECT COUNT(*) as total FROM users WHERE role != 'Admin' AND is_active=1")
+        total_koordinator = r["count"] if r else 0
+        r = run_query_one("SELECT COUNT(*) as total FROM users WHERE role='Korwil' AND is_active=1")
+        total_korwil = r["count"] if r else 0
+        r = run_query_one("SELECT COUNT(*) as total FROM users WHERE role='Korcam' AND is_active=1")
+        total_korcam = r["count"] if r else 0
+        rows = run_query("SELECT kota, COUNT(*) as jumlah FROM warga GROUP BY kota ORDER BY jumlah DESC")
+        df_kota = pd.DataFrame(rows)
+        rows = run_query("SELECT kecamatan, COUNT(*) as jumlah FROM warga GROUP BY kecamatan ORDER BY jumlah DESC LIMIT 15")
+        df_kecamatan = pd.DataFrame(rows)
+        rows = run_query("""
             SELECT u.nama_lengkap, u.kota, u.role, COUNT(w.id) as total_warga
-            FROM users u
-            LEFT JOIN warga w ON u.username = w.diinput_oleh
+            FROM users u LEFT JOIN warga w ON u.username = w.diinput_oleh
             WHERE u.role != 'Admin' AND u.is_active=1
-            GROUP BY u.id ORDER BY total_warga DESC
-        """, conn)
+            GROUP BY u.id, u.nama_lengkap, u.kota, u.role
+            ORDER BY total_warga DESC
+        """)
+        df_korwil_perf = pd.DataFrame(rows)
 
     elif role == "Korwil":
         kota = user.get("kota", "")
-        total_warga = pd.read_sql(f"SELECT COUNT(*) as total FROM warga WHERE kota=?", conn, params=(kota,)).iloc[0, 0]
-        total_koordinator = pd.read_sql(f"SELECT COUNT(*) as total FROM users WHERE kota=? AND role != 'Korwil' AND is_active=1", conn, params=(kota,)).iloc[0, 0]
+        r = run_query_one("SELECT COUNT(*) as total FROM warga WHERE kota=%s", (kota,))
+        total_warga = r["count"] if r else 0
+        r = run_query_one("SELECT COUNT(*) as total FROM users WHERE kota=%s AND role != 'Korwil' AND is_active=1", (kota,))
+        total_koordinator = r["count"] if r else 0
         total_korwil = 1
-        total_korcam = pd.read_sql(f"SELECT COUNT(*) as total FROM users WHERE kota=? AND role='Korcam' AND is_active=1", conn, params=(kota,)).iloc[0, 0]
-        df_kota = pd.read_sql(f"SELECT kecamatan as kota, COUNT(*) as jumlah FROM warga WHERE kota=? GROUP BY kecamatan ORDER BY jumlah DESC", conn, params=(kota,))
-        df_kecamatan = pd.read_sql(f"SELECT kelurahan as kecamatan, COUNT(*) as jumlah FROM warga WHERE kota=? GROUP BY kelurahan ORDER BY jumlah DESC LIMIT 15", conn, params=(kota,))
-        df_korwil_perf = pd.read_sql(f"""
+        r = run_query_one("SELECT COUNT(*) as total FROM users WHERE kota=%s AND role='Korcam' AND is_active=1", (kota,))
+        total_korcam = r["count"] if r else 0
+        rows = run_query("SELECT kecamatan as kota, COUNT(*) as jumlah FROM warga WHERE kota=%s GROUP BY kecamatan ORDER BY jumlah DESC", (kota,))
+        df_kota = pd.DataFrame(rows)
+        rows = run_query("SELECT kelurahan as kecamatan, COUNT(*) as jumlah FROM warga WHERE kota=%s GROUP BY kelurahan ORDER BY jumlah DESC LIMIT 15", (kota,))
+        df_kecamatan = pd.DataFrame(rows)
+        rows = run_query("""
             SELECT u.nama_lengkap, u.kecamatan, u.role, COUNT(w.id) as total_warga
             FROM users u LEFT JOIN warga w ON u.username = w.diinput_oleh
-            WHERE u.kota=? AND u.role != 'Admin' AND u.is_active=1
-            GROUP BY u.id ORDER BY total_warga DESC
-        """, conn, params=(kota,))
+            WHERE u.kota=%s AND u.role != 'Admin' AND u.is_active=1
+            GROUP BY u.id, u.nama_lengkap, u.kecamatan, u.role
+            ORDER BY total_warga DESC
+        """, (kota,))
+        df_korwil_perf = pd.DataFrame(rows)
 
     else:
         username = user.get("username", "")
-        total_warga = pd.read_sql("SELECT COUNT(*) as total FROM warga WHERE diinput_oleh=?", conn, params=(username,)).iloc[0, 0]
+        r = run_query_one("SELECT COUNT(*) as total FROM warga WHERE diinput_oleh=%s", (username,))
+        total_warga = r["count"] if r else 0
         total_koordinator = 1
         total_korwil = 0
         total_korcam = 0
         df_kota = pd.DataFrame(columns=["kota", "jumlah"])
         df_kecamatan = pd.DataFrame(columns=["kecamatan", "jumlah"])
         df_korwil_perf = pd.DataFrame(columns=["nama_lengkap", "role", "total_warga"])
-
-    conn.close()
 
     # --- METRIC CARDS ---
     col1, col2, col3, col4 = st.columns(4)
@@ -845,36 +948,42 @@ def page_input_warga():
             for err in errors:
                 st.error(f"❌ {err}")
         else:
-            conn = get_db()
-            c = conn.cursor()
-            # Cek duplikat NIK
-            c.execute("SELECT id FROM warga WHERE nik=?", (nik.strip(),))
-            existing = c.fetchone()
+            # Cek duplikat NIK — enkripsi NIK dulu untuk perbandingan
+            nik_encrypted = encrypt_data(nik.strip())
+            existing = run_query_one(
+                "SELECT id FROM warga WHERE nik=%s", (nik_encrypted,)
+            )
             if existing:
-                st.error("❌ NIK sudah terdaftar dalam sistem! Warga ini sudah pernah didata.")
-                conn.close()
+                st.error("❌ NIK sudah terdaftar! Warga ini sudah pernah didata.")
             else:
                 try:
-                    c.execute("""
+                    ok = run_query("""
                         INSERT INTO warga
-                        (nama_lengkap, nik, no_telepon, alamat, kota, kecamatan, kelurahan, rw, rt,
-                         latitude, longitude, diinput_oleh, diinput_nama, role_input,
+                        (nama_lengkap, nik, no_telepon, alamat, kota, kecamatan,
+                         kelurahan, rw, rt, latitude, longitude,
+                         diinput_oleh, diinput_nama, role_input,
                          kota_petugas, kecamatan_petugas, kelurahan_petugas)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     """, (
-                        nama.strip(), nik.strip(), no_telp.strip(), alamat.strip(),
-                        kota, kecamatan, kelurahan, int(rw), int(rt),
+                        nama.strip(),
+                        encrypt_data(nik.strip()),
+                        encrypt_data(no_telp.strip()),
+                        encrypt_data(alamat.strip()),
+                        kota, kecamatan, kelurahan,
+                        int(rw), int(rt),
                         float(latitude), float(longitude),
                         user["username"], user["nama_lengkap"], role,
-                        user.get("kota", ""), user.get("kecamatan", ""), user.get("kelurahan", "")
-                    ))
-                    conn.commit()
-                    st.success(f"✅ Data warga **{nama}** berhasil disimpan!")
-                    st.balloons()
+                        user.get("kota", ""),
+                        user.get("kecamatan", ""),
+                        user.get("kelurahan", "")
+                    ), fetch=False)
+                    if ok:
+                        st.success(f"✅ Data warga **{nama}** berhasil disimpan!")
+                        st.balloons()
+                    else:
+                        st.error("❌ Gagal menyimpan data.")
                 except Exception as e:
                     st.error(f"❌ Terjadi kesalahan: {str(e)}")
-                finally:
-                    conn.close()
 
 
 # ============================================================
@@ -891,47 +1000,52 @@ def page_data_warga():
     </div>
     """, unsafe_allow_html=True)
 
-    conn = get_db()
-
     # Filter sesuai role
+    def fetch_warga(query, params=None):
+        rows = run_query(query, params)
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows)
+        # Dekripsi kolom sensitif
+        for col in ["nik", "no_telepon", "alamat"]:
+            if col in df.columns:
+                df[col] = df[col].apply(lambda x: decrypt_data(x) if x else x)
+        return df
+
     if role == "Admin":
-        df = pd.read_sql("""
-            SELECT nama_lengkap as 'Nama', nik as 'NIK', no_telepon as 'Telepon',
-                   alamat as 'Alamat', kota as 'Kota', kecamatan as 'Kecamatan',
-                   kelurahan as 'Kelurahan', rw as 'RW', rt as 'RT',
-                   latitude as 'Lat', longitude as 'Lon',
-                   diinput_nama as 'Petugas', role_input as 'Jabatan Petugas',
-                   created_at as 'Tanggal Input'
+        df = fetch_warga("""
+            SELECT nama_lengkap as "Nama", nik as "NIK", no_telepon as "Telepon",
+                   alamat as "Alamat", kota as "Kota", kecamatan as "Kecamatan",
+                   kelurahan as "Kelurahan", rw as "RW", rt as "RT",
+                   diinput_nama as "Petugas", role_input as "Jabatan Petugas",
+                   created_at as "Tanggal Input"
             FROM warga ORDER BY created_at DESC
-        """, conn)
+        """)
     elif role == "Korwil":
         kota = user.get("kota", "")
-        df = pd.read_sql("""
-            SELECT nama_lengkap as 'Nama', nik as 'NIK', no_telepon as 'Telepon',
-                   alamat as 'Alamat', kota as 'Kota', kecamatan as 'Kecamatan',
-                   kelurahan as 'Kelurahan', rw as 'RW', rt as 'RT',
-                   diinput_nama as 'Petugas', role_input as 'Jabatan Petugas',
-                   created_at as 'Tanggal Input'
-            FROM warga WHERE kota=? ORDER BY created_at DESC
-        """, conn, params=(kota,))
+        df = fetch_warga("""
+            SELECT nama_lengkap as "Nama", nik as "NIK", no_telepon as "Telepon",
+                   alamat as "Alamat", kota as "Kota", kecamatan as "Kecamatan",
+                   kelurahan as "Kelurahan", rw as "RW", rt as "RT",
+                   diinput_nama as "Petugas", created_at as "Tanggal Input"
+            FROM warga WHERE kota=%s ORDER BY created_at DESC
+        """, (kota,))
     elif role == "Korcam":
         kecamatan = user.get("kecamatan", "")
-        df = pd.read_sql("""
-            SELECT nama_lengkap as 'Nama', nik as 'NIK', no_telepon as 'Telepon',
-                   alamat as 'Alamat', kelurahan as 'Kelurahan', rw as 'RW', rt as 'RT',
-                   diinput_nama as 'Petugas', created_at as 'Tanggal Input'
-            FROM warga WHERE kecamatan=? ORDER BY created_at DESC
-        """, conn, params=(kecamatan,))
+        df = fetch_warga("""
+            SELECT nama_lengkap as "Nama", nik as "NIK",
+                   kelurahan as "Kelurahan", rw as "RW", rt as "RT",
+                   diinput_nama as "Petugas", created_at as "Tanggal Input"
+            FROM warga WHERE kecamatan=%s ORDER BY created_at DESC
+        """, (kecamatan,))
     else:
         username = user.get("username", "")
-        df = pd.read_sql("""
-            SELECT nama_lengkap as 'Nama', nik as 'NIK', no_telepon as 'Telepon',
-                   alamat as 'Alamat', kelurahan as 'Kelurahan', rw as 'RW', rt as 'RT',
-                   created_at as 'Tanggal Input'
-            FROM warga WHERE diinput_oleh=? ORDER BY created_at DESC
-        """, conn, params=(username,))
-
-    conn.close()
+        df = fetch_warga("""
+            SELECT nama_lengkap as "Nama", nik as "NIK",
+                   kelurahan as "Kelurahan", rw as "RW", rt as "RT",
+                   created_at as "Tanggal Input"
+            FROM warga WHERE diinput_oleh=%s ORDER BY created_at DESC
+        """, (username,))
 
     # Filter UI
     st.markdown('<div class="section-title">🔍 Filter Data</div>', unsafe_allow_html=True)
@@ -1037,58 +1151,46 @@ def page_manajemen_tim():
             if errors:
                 for e in errors: st.error(f"❌ {e}")
             else:
-                conn = get_db()
-                c = conn.cursor()
-                try:
-                    c.execute("""
-                        INSERT INTO users (username, password, nama_lengkap, role, kota, kecamatan, kelurahan, rw)
-                        VALUES (?,?,?,?,?,?,?,?)
-                    """, (
-                        username_koor.strip().lower(),
-                        hash_password(password_koor),
-                        nama_koor.strip(),
-                        role_koor,
-                        kota_koor if kota_koor != "-- Pilih --" else "",
-                        kec_koor if kec_koor != "-- Pilih --" else "",
-                        kel_koor if kel_koor != "-- Pilih --" else "",
-                        rw_koor
-                    ))
-                    conn.commit()
+                ok = run_query("""
+                    INSERT INTO users (username, password, nama_lengkap, role, kota, kecamatan, kelurahan, rw)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (username) DO NOTHING
+                """, (
+                    username_koor.strip().lower(),
+                    hash_password(password_koor),
+                    nama_koor.strip(),
+                    role_koor,
+                    kota_koor if kota_koor != "-- Pilih --" else "",
+                    kec_koor if kec_koor != "-- Pilih --" else "",
+                    kel_koor if kel_koor != "-- Pilih --" else "",
+                    rw_koor
+                ), fetch=False)
+                if ok:
                     st.success(f"✅ Koordinator **{nama_koor}** ({role_koor}) berhasil didaftarkan!")
-                except sqlite3.IntegrityError:
-                    st.error("❌ Username sudah digunakan. Pilih username lain.")
-                except Exception as e:
-                    st.error(f"❌ Error: {str(e)}")
-                finally:
-                    conn.close()
+                else:
+                    st.error("❌ Username sudah digunakan atau terjadi kesalahan.")
 
     with tab2:
         st.markdown('<div class="section-title">📋 Daftar Semua Koordinator</div>', unsafe_allow_html=True)
-        conn = get_db()
-        df_tim = pd.read_sql("""
-            SELECT
-                u.nama_lengkap as 'Nama',
-                u.username as 'Username',
-                u.role as 'Jabatan',
-                u.kota as 'Kota',
-                u.kecamatan as 'Kecamatan',
-                u.kelurahan as 'Kelurahan',
-                u.rw as 'RW',
-                COUNT(w.id) as 'Total Warga Didata',
-                CASE WHEN u.is_active=1 THEN '✅ Aktif' ELSE '❌ Nonaktif' END as 'Status',
-                u.created_at as 'Dibuat'
+        rows = run_query("""
+            SELECT u.nama_lengkap as "Nama", u.username as "Username",
+                   u.role as "Jabatan", u.kota as "Kota",
+                   u.kecamatan as "Kecamatan", u.kelurahan as "Kelurahan",
+                   u.rw as "RW", COUNT(w.id) as "Total Warga Didata",
+                   CASE WHEN u.is_active=1 THEN '✅ Aktif' ELSE '❌ Nonaktif' END as "Status",
+                   u.created_at as "Dibuat"
             FROM users u
             LEFT JOIN warga w ON u.username = w.diinput_oleh
             WHERE u.role != 'Admin'
-            GROUP BY u.id
+            GROUP BY u.id, u.nama_lengkap, u.username, u.role,
+                     u.kota, u.kecamatan, u.kelurahan, u.rw,
+                     u.is_active, u.created_at
             ORDER BY u.role, u.kota
-        """, conn)
-        conn.close()
+        """)
+        df_tim = pd.DataFrame(rows) if rows else pd.DataFrame()
 
         if not df_tim.empty:
             st.dataframe(df_tim, use_container_width=True, hide_index=True)
-
-            # Download
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
                 df_tim.to_excel(writer, index=False, sheet_name="Tim Koordinator")
@@ -1101,11 +1203,10 @@ def page_manajemen_tim():
         else:
             st.info("Belum ada koordinator terdaftar.")
 
-        # Nonaktifkan koordinator
+        # Kelola status koordinator
         st.markdown('<div class="section-title">⚙️ Kelola Status Koordinator</div>', unsafe_allow_html=True)
-        conn = get_db()
-        df_users = pd.read_sql("SELECT id, nama_lengkap, username, role, is_active FROM users WHERE role != 'Admin'", conn)
-        conn.close()
+        rows_u = run_query("SELECT id, nama_lengkap, username, role, is_active FROM users WHERE role != 'Admin'")
+        df_users = pd.DataFrame(rows_u) if rows_u else pd.DataFrame()
 
         if not df_users.empty:
             col_a, col_b = st.columns([2, 1])
@@ -1121,10 +1222,10 @@ def page_manajemen_tim():
                 action_label = "❌ Nonaktifkan" if current_status == 1 else "✅ Aktifkan"
                 if st.button(action_label, use_container_width=True):
                     new_status = 0 if current_status == 1 else 1
-                    conn = get_db()
-                    conn.execute("UPDATE users SET is_active=? WHERE id=?", (new_status, sel_user))
-                    conn.commit()
-                    conn.close()
+                    run_query(
+                        "UPDATE users SET is_active=%s WHERE id=%s",
+                        (new_status, sel_user), fetch=False
+                    )
                     st.success("✅ Status berhasil diubah!")
                     st.rerun()
 
@@ -1157,19 +1258,19 @@ def page_pengaturan():
         elif len(new_pass) < 6:
             st.error("❌ Password baru minimal 6 karakter.")
         else:
-            conn = get_db()
-            c = conn.cursor()
-            c.execute("SELECT id FROM users WHERE username=? AND password=?",
-                      (user["username"], hash_password(old_pass)))
-            found = c.fetchone()
+            found = run_query_one(
+                "SELECT id FROM users WHERE username=%s AND password=%s",
+                (user["username"], hash_password(old_pass))
+            )
             if not found:
                 st.error("❌ Password lama salah.")
             else:
-                c.execute("UPDATE users SET password=? WHERE username=?",
-                          (hash_password(new_pass), user["username"]))
-                conn.commit()
-                st.success("✅ Password berhasil diubah!")
-            conn.close()
+                ok = run_query(
+                    "UPDATE users SET password=%s WHERE username=%s",
+                    (hash_password(new_pass), user["username"]), fetch=False
+                )
+                if ok:
+                    st.success("✅ Password berhasil diubah!")
 
     st.markdown('<div class="section-title">ℹ️ Informasi Akun</div>', unsafe_allow_html=True)
     info_data = {
