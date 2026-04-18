@@ -684,20 +684,28 @@ def page_dashboard():
     </div>
     """, unsafe_allow_html=True)
 
+    def get_count(query, params=None):
+        """Helper ambil nilai COUNT dari PostgreSQL"""
+        r = run_query_one(query, params)
+        if not r:
+            return 0
+        # PostgreSQL mengembalikan 'count' bukan nama alias
+        for key in ["count", "total"]:
+            if key in r:
+                return int(r[key])
+        # Ambil nilai pertama apapun kuncinya
+        return int(list(r.values())[0])
+
     # --- QUERY berdasarkan role ---
     if role == "Admin":
-        r = run_query_one("SELECT COUNT(*) as total FROM warga")
-        total_warga = r["count"] if r else 0
-        r = run_query_one("SELECT COUNT(*) as total FROM users WHERE role != 'Admin' AND is_active=1")
-        total_koordinator = r["count"] if r else 0
-        r = run_query_one("SELECT COUNT(*) as total FROM users WHERE role='Korwil' AND is_active=1")
-        total_korwil = r["count"] if r else 0
-        r = run_query_one("SELECT COUNT(*) as total FROM users WHERE role='Korcam' AND is_active=1")
-        total_korcam = r["count"] if r else 0
+        total_warga      = get_count("SELECT COUNT(*) FROM warga")
+        total_koordinator= get_count("SELECT COUNT(*) FROM users WHERE role != 'Admin' AND is_active=1")
+        total_korwil     = get_count("SELECT COUNT(*) FROM users WHERE role='Korwil' AND is_active=1")
+        total_korcam     = get_count("SELECT COUNT(*) FROM users WHERE role='Korcam' AND is_active=1")
         rows = run_query("SELECT kota, COUNT(*) as jumlah FROM warga GROUP BY kota ORDER BY jumlah DESC")
-        df_kota = pd.DataFrame(rows)
+        df_kota = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["kota","jumlah"])
         rows = run_query("SELECT kecamatan, COUNT(*) as jumlah FROM warga GROUP BY kecamatan ORDER BY jumlah DESC LIMIT 15")
-        df_kecamatan = pd.DataFrame(rows)
+        df_kecamatan = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["kecamatan","jumlah"])
         rows = run_query("""
             SELECT u.nama_lengkap, u.kota, u.role, COUNT(w.id) as total_warga
             FROM users u LEFT JOIN warga w ON u.username = w.diinput_oleh
@@ -705,21 +713,18 @@ def page_dashboard():
             GROUP BY u.id, u.nama_lengkap, u.kota, u.role
             ORDER BY total_warga DESC
         """)
-        df_korwil_perf = pd.DataFrame(rows)
+        df_korwil_perf = pd.DataFrame(rows) if rows else pd.DataFrame()
 
     elif role == "Korwil":
         kota = user.get("kota", "")
-        r = run_query_one("SELECT COUNT(*) as total FROM warga WHERE kota=%s", (kota,))
-        total_warga = r["count"] if r else 0
-        r = run_query_one("SELECT COUNT(*) as total FROM users WHERE kota=%s AND role != 'Korwil' AND is_active=1", (kota,))
-        total_koordinator = r["count"] if r else 0
-        total_korwil = 1
-        r = run_query_one("SELECT COUNT(*) as total FROM users WHERE kota=%s AND role='Korcam' AND is_active=1", (kota,))
-        total_korcam = r["count"] if r else 0
+        total_warga      = get_count("SELECT COUNT(*) FROM warga WHERE kota=%s", (kota,))
+        total_koordinator= get_count("SELECT COUNT(*) FROM users WHERE kota=%s AND role != 'Korwil' AND is_active=1", (kota,))
+        total_korwil     = 1
+        total_korcam     = get_count("SELECT COUNT(*) FROM users WHERE kota=%s AND role='Korcam' AND is_active=1", (kota,))
         rows = run_query("SELECT kecamatan as kota, COUNT(*) as jumlah FROM warga WHERE kota=%s GROUP BY kecamatan ORDER BY jumlah DESC", (kota,))
-        df_kota = pd.DataFrame(rows)
+        df_kota = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["kota","jumlah"])
         rows = run_query("SELECT kelurahan as kecamatan, COUNT(*) as jumlah FROM warga WHERE kota=%s GROUP BY kelurahan ORDER BY jumlah DESC LIMIT 15", (kota,))
-        df_kecamatan = pd.DataFrame(rows)
+        df_kecamatan = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["kecamatan","jumlah"])
         rows = run_query("""
             SELECT u.nama_lengkap, u.kecamatan, u.role, COUNT(w.id) as total_warga
             FROM users u LEFT JOIN warga w ON u.username = w.diinput_oleh
@@ -727,18 +732,17 @@ def page_dashboard():
             GROUP BY u.id, u.nama_lengkap, u.kecamatan, u.role
             ORDER BY total_warga DESC
         """, (kota,))
-        df_korwil_perf = pd.DataFrame(rows)
+        df_korwil_perf = pd.DataFrame(rows) if rows else pd.DataFrame()
 
     else:
         username = user.get("username", "")
-        r = run_query_one("SELECT COUNT(*) as total FROM warga WHERE diinput_oleh=%s", (username,))
-        total_warga = r["count"] if r else 0
-        total_koordinator = 1
-        total_korwil = 0
-        total_korcam = 0
-        df_kota = pd.DataFrame(columns=["kota", "jumlah"])
-        df_kecamatan = pd.DataFrame(columns=["kecamatan", "jumlah"])
-        df_korwil_perf = pd.DataFrame(columns=["nama_lengkap", "role", "total_warga"])
+        total_warga      = get_count("SELECT COUNT(*) FROM warga WHERE diinput_oleh=%s", (username,))
+        total_koordinator= 1
+        total_korwil     = 0
+        total_korcam     = 0
+        df_kota          = pd.DataFrame(columns=["kota", "jumlah"])
+        df_kecamatan     = pd.DataFrame(columns=["kecamatan", "jumlah"])
+        df_korwil_perf   = pd.DataFrame()
 
     # --- METRIC CARDS ---
     col1, col2, col3, col4 = st.columns(4)
