@@ -1,7 +1,7 @@
 """
 JAKDATA - Aplikasi Pendataan Warga DKI Jakarta
 Sistem Monitoring Kinerja Tim Koordinator Lapangan
-Versi 2.0 - PostgreSQL + Enkripsi Data
+Versi 3.0 - PostgreSQL + Enkripsi + Foto KTP + Auto-Archive
 """
 
 import streamlit as st
@@ -10,10 +10,14 @@ import hashlib
 import re
 from datetime import datetime
 import io
+import os
+import zipfile
+import base64
+import requests
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from cryptography.fernet import Fernet
-import os
+from PIL import Image
 
 # ============================================================
 # KONFIGURASI HALAMAN
@@ -579,6 +583,208 @@ def decrypt_data(data: str) -> str:
     return data
 
 # ============================================================
+# SUPABASE STORAGE — Foto KTP
+# ============================================================
+FOTO_TRIGGER_JUMLAH = 500    # Download ZIP saat 500 foto
+FOTO_TRIGGER_MB     = 200    # Download ZIP saat 200MB
+
+# Pengaturan kompresi foto
+FOTO_MAX_WIDTH  = 1200   # Lebar maksimal pixel
+FOTO_QUALITY    = 75     # Kualitas JPEG (75 = jernih tapi kecil)
+FOTO_MAX_KB     = 400    # Target ukuran maksimal KB
+
+def kompres_foto(file_bytes) -> bytes:
+    """
+    Kompres foto KTP otomatis:
+    - Resize jika terlalu besar
+    - Konversi ke JPEG
+    - Kualitas 75% (tetap terbaca jelas untuk KTP)
+    - Target ukuran: < 400KB
+    """
+    try:
+        img = Image.open(io.BytesIO(file_bytes))
+
+        # Konversi ke RGB jika perlu (PNG dengan transparansi)
+        if img.mode in ("RGBA", "P", "LA"):
+            img = img.convert("RGB")
+
+        # Resize jika lebar > 1200px
+        w, h = img.size
+        if w > FOTO_MAX_WIDTH:
+            ratio = FOTO_MAX_WIDTH / w
+            new_h = int(h * ratio)
+            img = img.resize((FOTO_MAX_WIDTH, new_h), Image.LANCZOS)
+
+        # Kompres dengan kualitas bertahap sampai < 400KB
+        quality = FOTO_QUALITY
+        while quality >= 40:
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=quality, optimize=True)
+            hasil = buf.getvalue()
+            if len(hasil) <= FOTO_MAX_KB * 1024:
+                return hasil
+            quality -= 10
+
+        # Fallback: resize lebih kecil
+        img = img.resize((800, int(img.size[1] * 800 / img.size[0])), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=60, optimize=True)
+        return buf.getvalue()
+
+    except Exception:
+        return file_bytes  # Kembalikan original jika gagal
+
+def get_supabase_headers():
+    """Header untuk Supabase Storage API"""
+    try:
+        key = st.secrets["SUPABASE_KEY"]
+        return {
+            "Authorization": f"Bearer {key}",
+            "apikey": key,
+        }
+    except:
+        return {}
+
+def get_supabase_url():
+    try:
+        return st.secrets["SUPABASE_URL"]
+    except:
+        return ""
+
+def upload_foto_ktp(file_bytes, filename, folder="warga"):
+    """Upload foto KTP ke Supabase Storage"""
+    try:
+        url = get_supabase_url()
+        headers = get_supabase_headers()
+        headers["Content-Type"] = "image/jpeg"
+
+        path = f"{folder}/{filename}"
+        endpoint = f"{url}/storage/v1/object/foto-ktp/{path}"
+
+        resp = requests.post(endpoint, headers=headers, data=file_bytes, timeout=30)
+        if resp.status_code in [200, 201]:
+            return path, True
+        return None, False
+    except Exception as e:
+        return None, False
+
+def delete_foto_supabase(path):
+    """Hapus foto dari Supabase Storage"""
+    try:
+        url  = get_supabase_url()
+        headers = get_supabase_headers()
+        headers["Content-Type"] = "application/json"
+        endpoint = f"{url}/storage/v1/object/foto-ktp/{path}"
+        resp = requests.delete(endpoint, headers=headers, timeout=15)
+        return resp.status_code in [200, 204]
+    except:
+        return False
+
+def download_foto_supabase(path):
+    """Download foto dari Supabase Storage"""
+    try:
+        url  = get_supabase_url()
+        headers = get_supabase_headers()
+        endpoint = f"{url}/storage/v1/object/foto-ktp/{path}"
+        resp = requests.get(endpoint, headers=headers, timeout=30)
+        if resp.status_code == 200:
+            return resp.content
+        return None
+    except:
+        return None
+
+def cek_status_archive():
+    """Cek apakah sudah waktunya archive (download ZIP)"""
+    r = run_query_one("""
+        SELECT COUNT(*) as jumlah,
+               COALESCE(SUM(ukuran_kb), 0) as total_kb
+        FROM foto_ktp
+        WHERE status = 'tersimpan'
+        AND deleted_at IS NULL
+    """)
+    if not r:
+        return 0, 0, False
+    jumlah   = int(list(r.values())[0])
+    total_kb = float(list(r.values())[1])
+    total_mb = total_kb / 1024
+    siap     = jumlah >= FOTO_TRIGGER_JUMLAH or total_mb >= FOTO_TRIGGER_MB
+    return jumlah, total_mb, siap
+
+def buat_zip_foto():
+    """Buat ZIP semua foto yang belum didownload"""
+    rows = run_query("""
+        SELECT f.id, f.foto_nama, f.username_petugas,
+               w.nama_lengkap, w.kota, w.kecamatan,
+               w.kelurahan, w.rw, w.rt,
+               f.created_at, w.foto_ktp_url
+        FROM foto_ktp f
+        JOIN warga w ON f.warga_id = w.id
+        WHERE f.status = 'tersimpan'
+        AND f.deleted_at IS NULL
+        ORDER BY f.created_at
+    """)
+
+    if not rows:
+        return None, 0
+
+    zip_buffer = io.BytesIO()
+    jumlah     = 0
+
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+        # Buat file index Excel di dalam ZIP
+        df_index = pd.DataFrame([{
+            "No":           i + 1,
+            "Nama Warga":   r["nama_lengkap"],
+            "Petugas":      r["username_petugas"],
+            "Wilayah":      f"{r['kota']} - {r['kecamatan']} - {r['kelurahan']}",
+            "RW/RT":        f"RW {r['rw']} RT {r['rt']}",
+            "File Foto":    r["foto_nama"],
+            "Tgl Input":    str(r["created_at"])[:16],
+        } for i, r in enumerate(rows)])
+
+        excel_buf = io.BytesIO()
+        with pd.ExcelWriter(excel_buf, engine='openpyxl') as writer:
+            df_index.to_excel(writer, index=False, sheet_name="Index Foto KTP")
+        zf.writestr("INDEX_FOTO_KTP.xlsx", excel_buf.getvalue())
+
+        # Download & tambahkan setiap foto
+        for row in rows:
+            if row.get("foto_ktp_url"):
+                foto_bytes = download_foto_supabase(row["foto_ktp_url"])
+                if foto_bytes:
+                    nama_file = f"{row['kota']}/{row['kecamatan']}/{row['kelurahan']}/RW{row['rw']}_RT{row['rt']}/{row['foto_nama']}"
+                    zf.writestr(nama_file, foto_bytes)
+                    jumlah += 1
+
+    zip_buffer.seek(0)
+    return zip_buffer.getvalue(), jumlah
+
+def tandai_sudah_didownload():
+    """Tandai semua foto sebagai sudah didownload & hapus dari storage"""
+    rows = run_query("""
+        SELECT id, foto_ktp_url FROM foto_ktp
+        WHERE status = 'tersimpan' AND deleted_at IS NULL
+    """)
+
+    now = datetime.now()
+    for row in rows:
+        # Hapus dari Supabase Storage
+        if row.get("foto_ktp_url"):
+            delete_foto_supabase(row["foto_ktp_url"])
+        # Tandai di database
+        run_query("""
+            UPDATE foto_ktp
+            SET status='didownload', downloaded_at=%s, deleted_at=%s
+            WHERE id=%s
+        """, (now, now, row["id"]), fetch=False)
+
+    # Update status di tabel warga
+    run_query("""
+        UPDATE warga SET foto_ktp_status='diarchive'
+        WHERE foto_ktp_status='ada'
+    """, fetch=False)
+
+# ============================================================
 # DATABASE — PostgreSQL dengan koneksi stabil & auto-reconnect
 # ============================================================
 def get_db():
@@ -936,7 +1142,7 @@ def render_sidebar():
 
         menus = ["📊 Dashboard", "➕ Input Data Warga", "📋 Data Warga"]
         if role == "Admin":
-            menus += ["👥 Manajemen Tim", "📜 Audit Log", "⚙️ Pengaturan"]
+            menus += ["👥 Manajemen Tim", "📦 Archive Foto KTP", "📜 Audit Log", "⚙️ Pengaturan"]
         else:
             menus += ["⚙️ Pengaturan"]
 
@@ -946,6 +1152,7 @@ def render_sidebar():
             "➕ Input Data Warga": "input_warga",
             "📋 Data Warga":       "data_warga",
             "👥 Manajemen Tim":    "manajemen_tim",
+            "📦 Archive Foto KTP": "archive_foto",
             "📜 Audit Log":        "audit_log",
             "⚙️ Pengaturan":       "pengaturan",
         }
@@ -1255,19 +1462,52 @@ def page_input_warga():
             else:
                 rt = st.number_input("RT *", min_value=1, max_value=99, value=1)
 
+        # FOTO KTP WARGA
+        st.markdown('<div class="section-title">📷 Foto KTP Warga (Wajib)</div>',
+                    unsafe_allow_html=True)
+        st.markdown("""
+        <div class="gps-box">
+            📷 <strong>Foto KTP langsung di tempat warga.</strong><br>
+            Pastikan foto jelas, tidak buram, dan seluruh KTP terlihat.<br>
+            Format: JPG/PNG | Semua ukuran diterima — foto dikompres otomatis 🗜️
+        </div>
+        """, unsafe_allow_html=True)
+        st.markdown("")
+        foto_ktp = st.file_uploader(
+            "Upload Foto KTP Warga *",
+            type=["jpg", "jpeg", "png"],
+            help="Semua ukuran foto diterima. Sistem akan kompres otomatis."
+        )
+        if foto_ktp:
+            # Preview foto asli
+            st.image(foto_ktp, caption="Preview Foto KTP", width=300)
+            ukuran_asli_kb = len(foto_ktp.getvalue()) / 1024
+
+            # Estimasi setelah kompres
+            foto_kompres = kompres_foto(foto_ktp.getvalue())
+            ukuran_kompres_kb = len(foto_kompres) / 1024
+
+            col_info1, col_info2 = st.columns(2)
+            with col_info1:
+                st.caption(f"📁 Ukuran asli: **{ukuran_asli_kb:.0f} KB**")
+            with col_info2:
+                st.caption(f"🗜️ Setelah kompres: **{ukuran_kompres_kb:.0f} KB**")
+            st.success(f"✅ Foto siap diupload (dikompres {((1 - ukuran_kompres_kb/ukuran_asli_kb)*100):.0f}%)")
+
         # GPS
-        st.markdown('<div class="section-title">🗺️ Titik Koordinat GPS</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">🗺️ Titik Koordinat GPS</div>',
+                    unsafe_allow_html=True)
         st.markdown("""
         <div class="gps-box">
             📍 Masukkan koordinat GPS secara manual.<br>
-            Cara: Buka Google Maps → tahan layar di lokasi warga → catat angka yang muncul.
+            Cara: Buka Google Maps → tahan layar di lokasi warga → catat angka.
         </div>
         """, unsafe_allow_html=True)
         st.markdown("")
 
         col_lat, col_lon = st.columns(2)
         with col_lat:
-            latitude = st.number_input("Latitude", value=-6.2088, format="%.6f", step=0.000001)
+            latitude  = st.number_input("Latitude",  value=-6.2088, format="%.6f", step=0.000001)
         with col_lon:
             longitude = st.number_input("Longitude", value=106.8456, format="%.6f", step=0.000001)
 
@@ -1291,12 +1531,13 @@ def page_input_warga():
             errors.append("Kecamatan wajib dipilih.")
         if kelurahan == "-- Pilih --":
             errors.append("Kelurahan wajib dipilih.")
+        if not foto_ktp:
+            errors.append("Foto KTP warga wajib diupload.")
 
         if errors:
             for err in errors:
                 st.error(f"❌ {err}")
         else:
-            # Cek duplikat NIK — enkripsi NIK dulu untuk perbandingan
             nik_encrypted = encrypt_data(nik.strip())
             existing = run_query_one(
                 "SELECT id FROM warga WHERE nik=%s", (nik_encrypted,)
@@ -1305,36 +1546,90 @@ def page_input_warga():
                 st.error("❌ NIK sudah terdaftar! Warga ini sudah pernah didata.")
             else:
                 try:
-                    ok = run_query("""
-                        INSERT INTO warga
-                        (nama_lengkap, nik, no_telepon, alamat, kota, kecamatan,
-                         kelurahan, rw, rt, latitude, longitude,
-                         diinput_oleh, diinput_nama, role_input,
-                         kota_petugas, kecamatan_petugas, kelurahan_petugas)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    """, (
-                        nama.strip(),
-                        encrypt_data(nik.strip()),
-                        encrypt_data(no_telp.strip()),
-                        encrypt_data(alamat.strip()),
-                        kota, kecamatan, kelurahan,
-                        int(rw), int(rt),
-                        float(latitude), float(longitude),
-                        user["username"], user["nama_lengkap"], role,
-                        user.get("kota", ""),
-                        user.get("kecamatan", ""),
-                        user.get("kelurahan", "")
-                    ), fetch=False)
-                    if ok:
-                        catat_log(
-                            user["username"], user["nama_lengkap"],
-                            "INPUT_WARGA",
-                            f"Input data warga: {nama.strip()} | {kecamatan} - {kelurahan} RW{rw} RT{rt}"
+                    with st.spinner("💾 Menyimpan data & mengupload foto..."):
+                        # Kompres foto sebelum upload
+                        foto_bytes_asli   = foto_ktp.getvalue()
+                        foto_bytes        = kompres_foto(foto_bytes_asli)
+                        ukuran_kb         = len(foto_bytes) / 1024
+                        ukuran_asli_kb    = len(foto_bytes_asli) / 1024
+
+                        # Upload foto KTP ke Supabase Storage
+                        timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        nama_file  = f"{nik.strip()[:8]}_{timestamp}.jpg"
+                        foto_path, upload_ok = upload_foto_ktp(
+                            foto_bytes, nama_file,
+                            folder=f"{kota}/{kecamatan}/{kelurahan}"
                         )
-                        st.success(f"✅ Data warga **{nama}** berhasil disimpan!")
-                        st.balloons()
-                    else:
-                        st.error("❌ Gagal menyimpan data.")
+
+                        # Simpan data warga
+                        ok = run_query("""
+                            INSERT INTO warga
+                            (nama_lengkap, nik, no_telepon, alamat,
+                             kota, kecamatan, kelurahan, rw, rt,
+                             latitude, longitude, foto_ktp_url,
+                             foto_ktp_status, diinput_oleh, diinput_nama,
+                             role_input, kota_petugas, kecamatan_petugas,
+                             kelurahan_petugas, rw_petugas, rt_petugas)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        """, (
+                            nama.strip(),
+                            encrypt_data(nik.strip()),
+                            encrypt_data(no_telp.strip()),
+                            encrypt_data(alamat.strip()),
+                            kota, kecamatan, kelurahan,
+                            int(rw), int(rt),
+                            float(latitude), float(longitude),
+                            foto_path or "",
+                            "ada" if upload_ok else "gagal",
+                            user["username"], user["nama_lengkap"], role,
+                            user.get("kota",""), user.get("kecamatan",""),
+                            user.get("kelurahan",""),
+                            user.get("rw",""), user.get("rt","")
+                        ), fetch=False)
+
+                        if ok:
+                            # Simpan record foto ke tabel foto_ktp
+                            warga_baru = run_query_one(
+                                "SELECT id FROM warga WHERE nik=%s", (nik_encrypted,)
+                            )
+                            if warga_baru and upload_ok:
+                                run_query("""
+                                    INSERT INTO foto_ktp
+                                    (warga_id, username_petugas, foto_nama,
+                                     ukuran_kb, status)
+                                    VALUES (%s,%s,%s,%s,'tersimpan')
+                                """, (
+                                    warga_baru["id"],
+                                    user["username"],
+                                    nama_file,
+                                    int(ukuran_kb)
+                                ), fetch=False)
+
+                            catat_log(
+                                user["username"], user["nama_lengkap"],
+                                "INPUT_WARGA",
+                                f"Warga: {nama.strip()} | {kecamatan}-{kelurahan} RW{rw} RT{rt} | Foto: {'✅' if upload_ok else '❌'}"
+                            )
+
+                            # Cek apakah sudah waktunya archive
+                            jumlah_foto, total_mb, siap_archive = cek_status_archive()
+
+                            st.success(f"✅ Data warga **{nama}** berhasil disimpan!")
+                            if upload_ok:
+                                hemat = ((1 - ukuran_kb/ukuran_asli_kb)*100)
+                                st.success(f"📷 Foto KTP berhasil diupload — {ukuran_asli_kb:.0f}KB → {ukuran_kb:.0f}KB (hemat {hemat:.0f}%)")
+                            else:
+                                st.warning("⚠️ Data tersimpan tapi foto gagal upload. Coba lagi.")
+
+                            if siap_archive:
+                                st.warning(f"""
+                                🗄️ **NOTIFIKASI ARCHIVE:**
+                                Sudah ada **{jumlah_foto:,} foto** ({total_mb:.0f} MB) tersimpan.
+                                Silakan Admin download ZIP di menu **📦 Archive Foto KTP**.
+                                """)
+                            st.balloons()
+                        else:
+                            st.error("❌ Gagal menyimpan data.")
                 except Exception as e:
                     st.error(f"❌ Terjadi kesalahan: {str(e)}")
 
@@ -1751,6 +2046,132 @@ def page_manajemen_tim():
 
 
 # ============================================================
+# HALAMAN ARCHIVE FOTO KTP (Admin Only)
+# ============================================================
+def page_archive_foto():
+    st.markdown("""
+    <div class="main-header">
+        <h1>📦 Archive Foto KTP</h1>
+        <p>Kelola & download foto KTP warga yang tersimpan di sistem</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Status foto saat ini
+    jumlah, total_mb, siap_archive = cek_status_archive()
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        warna = "#c62828" if siap_archive else "#1976d2"
+        st.markdown(f"""
+        <div class="metric-card" style="border-left-color:{warna};">
+            <div class="metric-icon">📷</div>
+            <div class="metric-value" style="color:{warna};">{jumlah:,}</div>
+            <div class="metric-label">Foto Tersimpan</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with col2:
+        st.markdown(f"""
+        <div class="metric-card" style="border-left-color:#fb8c00;">
+            <div class="metric-icon">💾</div>
+            <div class="metric-value" style="color:#fb8c00;">{total_mb:.0f} MB</div>
+            <div class="metric-label">Total Ukuran</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with col3:
+        persen_jumlah = min(100, (jumlah / FOTO_TRIGGER_JUMLAH) * 100)
+        persen_mb     = min(100, (total_mb / FOTO_TRIGGER_MB) * 100)
+        persen        = max(persen_jumlah, persen_mb)
+        warna_p = "#c62828" if persen >= 100 else "#fb8c00" if persen >= 70 else "#43a047"
+        st.markdown(f"""
+        <div class="metric-card" style="border-left-color:{warna_p};">
+            <div class="metric-icon">📊</div>
+            <div class="metric-value" style="color:{warna_p};">{persen:.0f}%</div>
+            <div class="metric-label">Kapasitas Terpakai</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown('<div class="custom-divider"></div>', unsafe_allow_html=True)
+
+    # Aturan auto-archive
+    st.markdown(f"""
+    <div class="wilayah-locked">
+        📋 <strong>Aturan Auto-Archive:</strong>
+        Download ZIP diperlukan saat foto mencapai
+        <strong>{FOTO_TRIGGER_JUMLAH:,} foto</strong>
+        ATAU <strong>{FOTO_TRIGGER_MB} MB</strong>.
+        Setelah download, foto dihapus otomatis dari server.
+    </div>
+    """, unsafe_allow_html=True)
+    st.markdown("")
+
+    # Tombol download ZIP
+    if jumlah > 0:
+        st.markdown('<div class="section-title">📥 Download & Archive</div>',
+                    unsafe_allow_html=True)
+
+        if siap_archive:
+            st.warning(f"⚠️ Sudah waktunya archive! Ada {jumlah:,} foto ({total_mb:.0f} MB)")
+
+        col_btn1, col_btn2 = st.columns(2)
+        with col_btn1:
+            if st.button("🗜️ Buat ZIP & Download Sekarang",
+                        use_container_width=True,
+                        type="primary" if siap_archive else "secondary"):
+                with st.spinner("📦 Mengemas foto ke ZIP... Mohon tunggu..."):
+                    zip_data, jumlah_foto = buat_zip_foto()
+
+                if zip_data and jumlah_foto > 0:
+                    tgl = datetime.now().strftime("%Y%m%d_%H%M")
+                    nama_zip = f"JAKDATA_FotoKTP_{tgl}_{jumlah_foto}foto.zip"
+                    st.download_button(
+                        label=f"📥 KLIK UNTUK DOWNLOAD ZIP ({jumlah_foto} foto)",
+                        data=zip_data,
+                        file_name=nama_zip,
+                        mime="application/zip",
+                        use_container_width=True
+                    )
+                    st.info("⚠️ Setelah download berhasil, klik tombol 'Konfirmasi & Hapus dari Server' di bawah.")
+                else:
+                    st.error("❌ Gagal membuat ZIP. Coba lagi.")
+
+        with col_btn2:
+            if st.button("✅ Konfirmasi Sudah Download → Hapus dari Server",
+                        use_container_width=True):
+                with st.spinner("🗑️ Menghapus foto dari server..."):
+                    tandai_sudah_didownload()
+                catat_log("admin", "Admin", "ARCHIVE_FOTO",
+                         f"Archive {jumlah} foto ({total_mb:.0f} MB) berhasil")
+                st.success(f"✅ {jumlah:,} foto berhasil dihapus dari server!")
+                st.success("📁 Foto aman tersimpan di file ZIP yang sudah Anda download.")
+                st.rerun()
+
+    else:
+        st.info("📭 Belum ada foto KTP tersimpan di server.")
+
+    st.markdown('<div class="custom-divider"></div>', unsafe_allow_html=True)
+
+    # Riwayat archive
+    st.markdown('<div class="section-title">📜 Riwayat Archive</div>',
+                unsafe_allow_html=True)
+    rows_hist = run_query("""
+        SELECT TO_CHAR(downloaded_at, 'DD/MM/YYYY HH24:MI') as "Tgl Download",
+               COUNT(*) as "Jumlah Foto",
+               SUM(ukuran_kb) / 1024 as "Total MB"
+        FROM foto_ktp
+        WHERE downloaded_at IS NOT NULL
+        GROUP BY DATE_TRUNC('minute', downloaded_at)
+        ORDER BY downloaded_at DESC
+        LIMIT 20
+    """)
+    if rows_hist:
+        df_hist = pd.DataFrame(rows_hist)
+        df_hist["Total MB"] = df_hist["Total MB"].apply(lambda x: f"{float(x):.1f} MB")
+        st.dataframe(df_hist, use_container_width=True, hide_index=True)
+    else:
+        st.info("Belum ada riwayat archive.")
+
+
+# ============================================================
 # HALAMAN PENGATURAN
 # ============================================================
 def page_pengaturan():
@@ -1934,7 +2355,12 @@ def main():
         if user_role == "Admin":
             page_manajemen_tim()
         else:
-            st.error("🚫 Akses ditolak. Halaman ini hanya untuk Admin.")
+            st.error("🚫 Akses ditolak.")
+    elif page == "archive_foto":
+        if user_role == "Admin":
+            page_archive_foto()
+        else:
+            st.error("🚫 Akses ditolak.")
     elif page == "audit_log":
         if user_role == "Admin":
             page_audit_log()
