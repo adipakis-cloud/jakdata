@@ -393,26 +393,17 @@ WILAYAH_DKI = {
 # ============================================================
 # ENKRIPSI DATA (UU PDP Compliant)
 # ============================================================
+@st.cache_resource
 def get_cipher():
-    """Ambil cipher untuk enkripsi/dekripsi data sensitif"""
+    """Ambil cipher dari ENCRYPT_KEY di Secrets"""
     try:
-        key = st.secrets.get("ENCRYPT_KEY", None)
-        if key:
-            return Fernet(key.encode())
-    except:
-        pass
-    # Fallback: generate key dari DATABASE_URL (konsisten)
-    try:
-        db_url = st.secrets["DATABASE_URL"]
-        seed = hashlib.sha256(db_url.encode()).digest()
-        key = base64.urlsafe_b64encode(seed)
-        return Fernet(key)
+        key = st.secrets["ENCRYPT_KEY"]
+        return Fernet(key.encode())
     except:
         return None
 
 def encrypt_data(data: str) -> str:
-    """Enkripsi data sensitif"""
-    if not data:
+    if not data or not data.strip():
         return data
     try:
         cipher = get_cipher()
@@ -423,8 +414,7 @@ def encrypt_data(data: str) -> str:
     return data
 
 def decrypt_data(data: str) -> str:
-    """Dekripsi data sensitif"""
-    if not data:
+    if not data or not data.strip():
         return data
     try:
         cipher = get_cipher()
@@ -435,35 +425,29 @@ def decrypt_data(data: str) -> str:
     return data
 
 # ============================================================
-# DATABASE SETUP — PostgreSQL
+# DATABASE — PostgreSQL dengan koneksi stabil & auto-reconnect
 # ============================================================
-@st.cache_resource
-def get_db_connection():
-    """Koneksi PostgreSQL via Supabase"""
+def get_db():
+    """Buat koneksi PostgreSQL baru setiap query — paling stabil"""
     try:
         db_url = st.secrets["DATABASE_URL"]
-        conn = psycopg2.connect(db_url, cursor_factory=RealDictCursor)
+        conn = psycopg2.connect(
+            db_url,
+            cursor_factory=RealDictCursor,
+            connect_timeout=10,
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=5
+        )
         conn.autocommit = False
         return conn
     except Exception as e:
         st.error(f"❌ Gagal koneksi database: {str(e)}")
         return None
 
-def get_db():
-    """Dapatkan koneksi database yang aktif"""
-    conn = get_db_connection()
-    if conn:
-        try:
-            # Test koneksi masih aktif
-            conn.cursor().execute("SELECT 1")
-        except:
-            # Reset jika koneksi mati
-            st.cache_resource.clear()
-            conn = get_db_connection()
-    return conn
-
 def run_query(query, params=None, fetch=True):
-    """Jalankan query dengan error handling"""
+    """Jalankan query — koneksi dibuka & ditutup otomatis"""
     conn = get_db()
     if not conn:
         return [] if fetch else False
@@ -472,99 +456,204 @@ def run_query(query, params=None, fetch=True):
         cur.execute(query, params or ())
         if fetch:
             result = cur.fetchall()
+            conn.close()
             return [dict(row) for row in result]
         else:
             conn.commit()
+            conn.close()
             return True
     except Exception as e:
-        conn.rollback()
-        st.error(f"❌ Database error: {str(e)}")
-        return [] if fetch else False
+        try:
+            conn.rollback()
+            conn.close()
+        except:
+            pass
+        if fetch:
+            return []
+        return False
 
 def run_query_one(query, params=None):
-    """Jalankan query dan ambil satu baris"""
     result = run_query(query, params, fetch=True)
     return result[0] if result else None
 
+def get_count(query, params=None):
+    """Helper khusus untuk query COUNT"""
+    r = run_query_one(query, params)
+    if not r:
+        return 0
+    return int(list(r.values())[0])
+
 def init_db():
-    """Inisialisasi tabel PostgreSQL"""
+    """Inisialisasi semua tabel PostgreSQL"""
     conn = get_db()
     if not conn:
         return
+    try:
+        cur = conn.cursor()
 
-    cur = conn.cursor()
+        # Tabel users
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                username VARCHAR(100) UNIQUE NOT NULL,
+                password VARCHAR(255) NOT NULL,
+                nama_lengkap VARCHAR(255) NOT NULL,
+                role VARCHAR(50) NOT NULL,
+                kota VARCHAR(100) DEFAULT '',
+                kecamatan VARCHAR(100) DEFAULT '',
+                kelurahan VARCHAR(100) DEFAULT '',
+                rw VARCHAR(20) DEFAULT '',
+                created_at TIMESTAMP DEFAULT NOW(),
+                is_active INTEGER DEFAULT 1,
+                last_login TIMESTAMP,
+                login_attempts INTEGER DEFAULT 0,
+                locked_until TIMESTAMP
+            )
+        """)
 
-    # Tabel users
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id SERIAL PRIMARY KEY,
-            username VARCHAR(100) UNIQUE NOT NULL,
-            password VARCHAR(255) NOT NULL,
-            nama_lengkap VARCHAR(255) NOT NULL,
-            role VARCHAR(50) NOT NULL,
-            kota VARCHAR(100),
-            kecamatan VARCHAR(100),
-            kelurahan VARCHAR(100),
-            rw VARCHAR(20),
-            created_at TIMESTAMP DEFAULT NOW(),
-            is_active INTEGER DEFAULT 1
-        )
-    """)
+        # Tabel warga
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS warga (
+                id SERIAL PRIMARY KEY,
+                nama_lengkap VARCHAR(255) NOT NULL,
+                nik VARCHAR(512) UNIQUE NOT NULL,
+                no_telepon VARCHAR(512),
+                alamat TEXT,
+                kota VARCHAR(100),
+                kecamatan VARCHAR(100),
+                kelurahan VARCHAR(100),
+                rw INTEGER,
+                rt INTEGER,
+                latitude DOUBLE PRECISION,
+                longitude DOUBLE PRECISION,
+                diinput_oleh VARCHAR(100),
+                diinput_nama VARCHAR(255),
+                role_input VARCHAR(50),
+                kota_petugas VARCHAR(100),
+                kecamatan_petugas VARCHAR(100),
+                kelurahan_petugas VARCHAR(100),
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
 
-    # Tabel warga
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS warga (
-            id SERIAL PRIMARY KEY,
-            nama_lengkap VARCHAR(255) NOT NULL,
-            nik VARCHAR(512) UNIQUE NOT NULL,
-            no_telepon VARCHAR(512),
-            alamat TEXT,
-            kota VARCHAR(100),
-            kecamatan VARCHAR(100),
-            kelurahan VARCHAR(100),
-            rw INTEGER,
-            rt INTEGER,
-            latitude DOUBLE PRECISION,
-            longitude DOUBLE PRECISION,
-            diinput_oleh VARCHAR(100),
-            diinput_nama VARCHAR(255),
-            role_input VARCHAR(50),
-            kota_petugas VARCHAR(100),
-            kecamatan_petugas VARCHAR(100),
-            kelurahan_petugas VARCHAR(100),
-            created_at TIMESTAMP DEFAULT NOW()
-        )
-    """)
+        # Tabel audit log
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id SERIAL PRIMARY KEY,
+                username VARCHAR(100),
+                nama VARCHAR(255),
+                aksi VARCHAR(100),
+                detail TEXT,
+                ip_address VARCHAR(50),
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
 
-    # Admin default
-    admin_password = hash_password("admin123")
-    cur.execute("""
-        INSERT INTO users (username, password, nama_lengkap, role)
+        # Tambah kolom baru jika belum ada (untuk upgrade)
+        for col_sql in [
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMP",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS login_attempts INTEGER DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until TIMESTAMP",
+        ]:
+            try:
+                cur.execute(col_sql)
+            except:
+                pass
+
+        # Admin default
+        admin_pw = hash_password("admin123")
+        cur.execute("""
+            INSERT INTO users (username, password, nama_lengkap, role)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (username) DO NOTHING
+        """, ("admin", admin_pw, "Administrator Provinsi DKI Jakarta", "Admin"))
+
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+    finally:
+        conn.close()
+
+def catat_log(username, nama, aksi, detail=""):
+    """Catat aktivitas ke audit log"""
+    run_query("""
+        INSERT INTO audit_log (username, nama, aksi, detail)
         VALUES (%s, %s, %s, %s)
-        ON CONFLICT (username) DO NOTHING
-    """, ("admin", admin_password,
-          "Administrator Provinsi DKI Jakarta", "Admin"))
-
-    conn.commit()
+    """, (username, nama, aksi, detail), fetch=False)
 
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
 # ============================================================
-# FUNGSI AUTENTIKASI
+# FUNGSI AUTENTIKASI — dengan proteksi brute force
 # ============================================================
+MAX_LOGIN_ATTEMPTS = 5
+LOCKOUT_MINUTES    = 15
+
 def login(username, password):
-    hashed = hash_password(password)
+    """Login dengan proteksi brute force"""
+    from datetime import timezone
+    now = datetime.now()
+
+    # Cek apakah user ada
     user = run_query_one(
-        "SELECT * FROM users WHERE username=%s AND password=%s AND is_active=1",
-        (username, hashed)
+        "SELECT * FROM users WHERE username=%s AND is_active=1",
+        (username,)
     )
-    return user
+    if not user:
+        return None, "❌ Username atau password salah!"
+
+    # Cek apakah akun terkunci
+    locked_until = user.get("locked_until")
+    if locked_until:
+        if isinstance(locked_until, str):
+            locked_until = datetime.fromisoformat(locked_until)
+        # Hapus timezone info untuk perbandingan
+        if hasattr(locked_until, 'tzinfo') and locked_until.tzinfo:
+            locked_until = locked_until.replace(tzinfo=None)
+        if now < locked_until:
+            sisa = int((locked_until - now).total_seconds() / 60) + 1
+            return None, f"🔒 Akun terkunci! Coba lagi dalam {sisa} menit."
+
+    # Verifikasi password
+    hashed = hash_password(password)
+    if user["password"] != hashed:
+        attempts = (user.get("login_attempts") or 0) + 1
+        if attempts >= MAX_LOGIN_ATTEMPTS:
+            from datetime import timedelta
+            lock_time = now + timedelta(minutes=LOCKOUT_MINUTES)
+            run_query("""
+                UPDATE users SET login_attempts=%s, locked_until=%s
+                WHERE username=%s
+            """, (attempts, lock_time, username), fetch=False)
+            catat_log(username, user["nama_lengkap"], "LOGIN_GAGAL_TERKUNCI",
+                     f"Akun terkunci setelah {attempts} percobaan")
+            return None, f"🔒 Terlalu banyak percobaan! Akun terkunci {LOCKOUT_MINUTES} menit."
+        else:
+            run_query(
+                "UPDATE users SET login_attempts=%s WHERE username=%s",
+                (attempts, username), fetch=False
+            )
+            sisa_coba = MAX_LOGIN_ATTEMPTS - attempts
+            catat_log(username, user["nama_lengkap"], "LOGIN_GAGAL",
+                     f"Password salah, sisa percobaan: {sisa_coba}")
+            return None, f"❌ Password salah! Sisa percobaan: {sisa_coba}"
+
+    # Login berhasil — reset attempts, catat waktu login
+    run_query("""
+        UPDATE users SET login_attempts=0, locked_until=NULL, last_login=%s
+        WHERE username=%s
+    """, (now, username), fetch=False)
+
+    catat_log(username, user["nama_lengkap"], "LOGIN_BERHASIL", "Login ke sistem")
+    return dict(user), None
 
 def logout():
-    for key in ["user", "page"]:
-        if key in st.session_state:
-            del st.session_state[key]
+    user = st.session_state.get("user", {})
+    if user:
+        catat_log(user.get("username",""), user.get("nama_lengkap",""), "LOGOUT", "Keluar dari sistem")
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
     st.rerun()
 
 # ============================================================
@@ -592,19 +681,18 @@ def page_login():
             with col_a:
                 if st.button("🚀 Masuk", use_container_width=True):
                     if username and password:
-                        user = login(username, password)
+                        user, pesan = login(username.strip().lower(), password)
                         if user:
                             st.session_state["user"] = user
                             st.session_state["page"] = "dashboard"
                             st.success("✅ Login berhasil!")
                             st.rerun()
                         else:
-                            st.error("❌ Username atau password salah!")
+                            st.error(pesan)
                     else:
                         st.warning("⚠️ Harap isi username dan password.")
 
             st.markdown("---")
-            st.caption("💡 **Demo:** Username: `admin` | Password: `admin123`")
             st.caption("📌 Hubungi administrator untuk mendapatkan akun koordinator.")
 
 # ============================================================
@@ -622,7 +710,6 @@ def render_sidebar():
         </div>
         """, unsafe_allow_html=True)
 
-        # Info user
         role = user.get("role", "-")
         nama = user.get("nama_lengkap", "-")
 
@@ -640,27 +727,39 @@ def render_sidebar():
                 st.caption(f"🏘️ {user.get('kecamatan', '')}")
             if user.get("kelurahan"):
                 st.caption(f"🏠 {user.get('kelurahan', '')}")
+            if user.get("rw"):
+                st.caption(f"🏡 RW {user.get('rw', '')}")
+
+        # Tampilkan last login
+        last_login = user.get("last_login")
+        if last_login:
+            if isinstance(last_login, str):
+                last_login = last_login[:16]
+            else:
+                last_login = str(last_login)[:16]
+            st.caption(f"🕐 Login: {last_login}")
 
         st.markdown("---")
         st.markdown("**📋 MENU NAVIGASI**")
 
-        # Menu berdasarkan role
         menus = ["📊 Dashboard", "➕ Input Data Warga", "📋 Data Warga"]
         if role == "Admin":
-            menus += ["👥 Manajemen Tim", "⚙️ Pengaturan"]
+            menus += ["👥 Manajemen Tim", "📜 Audit Log", "⚙️ Pengaturan"]
+        else:
+            menus += ["⚙️ Pengaturan"]
 
         current_page = st.session_state.get("page", "dashboard")
         page_map = {
-            "📊 Dashboard": "dashboard",
+            "📊 Dashboard":        "dashboard",
             "➕ Input Data Warga": "input_warga",
-            "📋 Data Warga": "data_warga",
-            "👥 Manajemen Tim": "manajemen_tim",
-            "⚙️ Pengaturan": "pengaturan",
+            "📋 Data Warga":       "data_warga",
+            "👥 Manajemen Tim":    "manajemen_tim",
+            "📜 Audit Log":        "audit_log",
+            "⚙️ Pengaturan":       "pengaturan",
         }
 
         for menu in menus:
             is_active = page_map.get(menu) == current_page
-            style = "background: rgba(255,255,255,0.2); border-radius: 8px; padding: 0.2rem 0;" if is_active else ""
             if st.button(menu, use_container_width=True, key=f"nav_{menu}"):
                 st.session_state["page"] = page_map[menu]
                 st.rerun()
@@ -982,6 +1081,11 @@ def page_input_warga():
                         user.get("kelurahan", "")
                     ), fetch=False)
                     if ok:
+                        catat_log(
+                            user["username"], user["nama_lengkap"],
+                            "INPUT_WARGA",
+                            f"Input data warga: {nama.strip()} | {kecamatan} - {kelurahan} RW{rw} RT{rt}"
+                        )
                         st.success(f"✅ Data warga **{nama}** berhasil disimpan!")
                         st.balloons()
                     else:
@@ -1278,12 +1382,13 @@ def page_pengaturan():
 
     st.markdown('<div class="section-title">ℹ️ Informasi Akun</div>', unsafe_allow_html=True)
     info_data = {
-        "Nama Lengkap": user.get("nama_lengkap", "-"),
-        "Username": user.get("username", "-"),
-        "Jabatan": user.get("role", "-"),
-        "Kota Tugas": user.get("kota") or "-",
+        "Nama Lengkap":    user.get("nama_lengkap", "-"),
+        "Username":        user.get("username", "-"),
+        "Jabatan":         user.get("role", "-"),
+        "Kota Tugas":      user.get("kota") or "-",
         "Kecamatan Tugas": user.get("kecamatan") or "-",
         "Kelurahan Tugas": user.get("kelurahan") or "-",
+        "RW Tugas":        user.get("rw") or "-",
     }
     for k, v in info_data.items():
         col1, col2 = st.columns([1, 2])
@@ -1292,6 +1397,105 @@ def page_pengaturan():
         with col2:
             st.markdown(v)
 
+    # Ganti password dengan catat log
+    if submit_pass:
+        pass  # sudah ditangani di atas
+
+
+# ============================================================
+# HALAMAN AUDIT LOG (Admin Only)
+# ============================================================
+def page_audit_log():
+    st.markdown("""
+    <div class="main-header">
+        <h1>📜 Audit Log Aktivitas</h1>
+        <p>Rekam jejak semua aktivitas pengguna dalam sistem JAKDATA</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Filter
+    st.markdown('<div class="section-title">🔍 Filter Log</div>', unsafe_allow_html=True)
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        filter_aksi = st.selectbox("Filter Aksi", [
+            "Semua", "LOGIN_BERHASIL", "LOGIN_GAGAL",
+            "LOGIN_GAGAL_TERKUNCI", "LOGOUT", "INPUT_WARGA"
+        ])
+    with col2:
+        filter_user = st.text_input("Cari Username...")
+    with col3:
+        limit = st.selectbox("Tampilkan", [50, 100, 200, 500], index=0)
+
+    # Query
+    query = """
+        SELECT created_at as "Waktu", username as "Username",
+               nama as "Nama", aksi as "Aksi", detail as "Detail"
+        FROM audit_log
+        WHERE 1=1
+    """
+    params = []
+    if filter_aksi != "Semua":
+        query += " AND aksi=%s"
+        params.append(filter_aksi)
+    if filter_user:
+        query += " AND username ILIKE %s"
+        params.append(f"%{filter_user}%")
+    query += f" ORDER BY created_at DESC LIMIT {limit}"
+
+    rows = run_query(query, params if params else None)
+    df_log = pd.DataFrame(rows) if rows else pd.DataFrame()
+
+    if not df_log.empty:
+        # Warna berdasarkan aksi
+        def style_aksi(val):
+            if "GAGAL" in str(val) or "TERKUNCI" in str(val):
+                return "color: #c62828; font-weight: bold"
+            elif "BERHASIL" in str(val):
+                return "color: #2e7d32; font-weight: bold"
+            return ""
+
+        st.markdown(f'<span class="info-badge">📊 {len(df_log)} aktivitas ditemukan</span>',
+                   unsafe_allow_html=True)
+        st.markdown("")
+        st.dataframe(df_log, use_container_width=True, hide_index=True, height=450)
+
+        # Download
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df_log.to_excel(writer, index=False, sheet_name="Audit Log")
+        st.download_button(
+            "📥 Download Audit Log",
+            data=output.getvalue(),
+            file_name=f"JAKDATA_AuditLog_{datetime.now().strftime('%Y%m%d')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+    else:
+        st.info("📭 Belum ada aktivitas tercatat.")
+
+    # Ringkasan
+    st.markdown('<div class="section-title">📊 Ringkasan Aktivitas Hari Ini</div>',
+               unsafe_allow_html=True)
+    col1, col2, col3, col4 = st.columns(4)
+    stats = [
+        ("LOGIN_BERHASIL", "✅ Login Berhasil", "#43a047"),
+        ("LOGIN_GAGAL",    "❌ Login Gagal",    "#e53935"),
+        ("LOGIN_GAGAL_TERKUNCI", "🔒 Akun Terkunci", "#f57f17"),
+        ("INPUT_WARGA",   "📝 Input Warga",    "#1976d2"),
+    ]
+    for col, (aksi, label, warna) in zip([col1,col2,col3,col4], stats):
+        r = run_query_one("""
+            SELECT COUNT(*) FROM audit_log
+            WHERE aksi=%s AND created_at >= NOW() - INTERVAL '24 hours'
+        """, (aksi,))
+        jumlah = int(list(r.values())[0]) if r else 0
+        with col:
+            st.markdown(f"""
+            <div class="metric-card" style="border-left-color:{warna};">
+                <div class="metric-value" style="color:{warna};font-size:1.8rem;">{jumlah}</div>
+                <div class="metric-label">{label}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
 
 # ============================================================
 # MAIN APP
@@ -1299,16 +1503,14 @@ def page_pengaturan():
 def main():
     init_db()
 
-    # Cek login
     if "user" not in st.session_state:
         page_login()
         return
 
-    # Render sidebar
     render_sidebar()
 
-    # Routing halaman
     page = st.session_state.get("page", "dashboard")
+    user_role = st.session_state.get("user", {}).get("role", "")
 
     if page == "dashboard":
         page_dashboard()
@@ -1317,9 +1519,13 @@ def main():
     elif page == "data_warga":
         page_data_warga()
     elif page == "manajemen_tim":
-        user_role = st.session_state.get("user", {}).get("role", "")
         if user_role == "Admin":
             page_manajemen_tim()
+        else:
+            st.error("🚫 Akses ditolak. Halaman ini hanya untuk Admin.")
+    elif page == "audit_log":
+        if user_role == "Admin":
+            page_audit_log()
         else:
             st.error("🚫 Akses ditolak. Halaman ini hanya untuk Admin.")
     elif page == "pengaturan":
