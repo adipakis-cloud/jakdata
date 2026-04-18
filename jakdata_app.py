@@ -324,6 +324,160 @@ html, body, [class*="css"] {
     background: linear-gradient(90deg, transparent, #dde6ff, transparent);
     margin: 1.5rem 0;
 }
+
+/* ============================================
+   MOBILE RESPONSIVE — Optimasi untuk HP
+   ============================================ */
+@media (max-width: 768px) {
+
+    /* Header lebih kompak di HP */
+    .main-header {
+        padding: 1.2rem 1rem;
+        border-radius: 12px;
+        margin-bottom: 1rem;
+    }
+    .main-header h1 {
+        font-size: 1.4rem;
+    }
+    .main-header p {
+        font-size: 0.8rem;
+    }
+
+    /* Metric cards lebih kecil di HP */
+    .metric-card {
+        padding: 1rem;
+        border-radius: 10px;
+        margin-bottom: 0.5rem;
+    }
+    .metric-card .metric-value {
+        font-size: 1.6rem;
+    }
+    .metric-card .metric-label {
+        font-size: 0.72rem;
+    }
+    .metric-card .metric-icon {
+        font-size: 1.3rem;
+    }
+
+    /* Form container di HP */
+    .form-container {
+        padding: 1rem;
+        border-radius: 10px;
+    }
+
+    /* Login card full width di HP */
+    .login-card {
+        padding: 1.5rem 1rem;
+        margin: 1rem auto;
+        border-radius: 14px;
+    }
+    .login-logo h1 {
+        font-size: 2rem;
+    }
+
+    /* Tombol lebih besar di HP — mudah dipencet */
+    .stButton > button {
+        min-height: 48px !important;
+        font-size: 1rem !important;
+        border-radius: 10px !important;
+    }
+
+    /* Input field lebih besar di HP */
+    .stTextInput > div > div > input,
+    .stTextArea > div > div > textarea,
+    .stNumberInput > div > div > input {
+        font-size: 16px !important;
+        min-height: 44px !important;
+        padding: 0.6rem 0.8rem !important;
+    }
+
+    /* Selectbox lebih besar di HP */
+    .stSelectbox > div > div {
+        min-height: 44px !important;
+        font-size: 16px !important;
+    }
+
+    /* Section title lebih kecil di HP */
+    .section-title {
+        font-size: 0.95rem;
+        margin: 1rem 0 0.7rem 0;
+    }
+
+    /* GPS box di HP */
+    .gps-box {
+        font-size: 0.82rem;
+        padding: 0.8rem;
+        flex-direction: column;
+        gap: 0.4rem;
+    }
+
+    /* Tab di HP */
+    .stTabs [data-baseweb="tab"] {
+        font-size: 0.82rem;
+        padding: 0.4rem 0.6rem;
+    }
+
+    /* Dataframe di HP */
+    .stDataFrame {
+        font-size: 0.8rem;
+    }
+
+    /* Sidebar lebih baik di HP */
+    [data-testid="stSidebar"] {
+        min-width: 200px !important;
+    }
+}
+
+/* Tombol navigasi sidebar lebih besar */
+[data-testid="stSidebar"] .stButton > button {
+    min-height: 44px !important;
+    font-size: 0.9rem !important;
+    text-align: left !important;
+    padding-left: 1rem !important;
+}
+
+/* Badge info */
+.status-badge-merah {
+    background: #ffebee;
+    color: #c62828;
+    padding: 0.3rem 0.8rem;
+    border-radius: 20px;
+    font-size: 0.82rem;
+    font-weight: 700;
+    display: inline-block;
+}
+.status-badge-kuning {
+    background: #fff8e1;
+    color: #f57f17;
+    padding: 0.3rem 0.8rem;
+    border-radius: 20px;
+    font-size: 0.82rem;
+    font-weight: 700;
+    display: inline-block;
+}
+.status-badge-hijau {
+    background: #e8f5e9;
+    color: #2e7d32;
+    padding: 0.3rem 0.8rem;
+    border-radius: 20px;
+    font-size: 0.82rem;
+    font-weight: 700;
+    display: inline-block;
+}
+
+/* Warning box wilayah terkunci */
+.wilayah-locked {
+    background: #e8f0fe;
+    border: 2px solid #1976d2;
+    border-radius: 10px;
+    padding: 0.8rem 1rem;
+    color: #0d47a1;
+    font-weight: 600;
+    font-size: 0.9rem;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -933,80 +1087,117 @@ def page_input_warga():
     </div>
     """, unsafe_allow_html=True)
 
-    # Wilayah petugas (untuk non-admin, sudah terkunci sesuai wilayah)
+    # Wilayah petugas — terkunci ketat sesuai role
     role = user.get("role", "")
-    prefill_kota = user.get("kota", "")
-    prefill_kecamatan = user.get("kecamatan", "")
-    prefill_kelurahan = user.get("kelurahan", "")
+    prefill_kota      = user.get("kota", "") or ""
+    prefill_kecamatan = user.get("kecamatan", "") or ""
+    prefill_kelurahan = user.get("kelurahan", "") or ""
+    prefill_rw        = user.get("rw", "") or ""
 
-    # ── PILIHAN WILAYAH (di luar form agar cascade bisa bekerja) ──
-    st.markdown('<div class="section-title">📍 Wilayah Tempat Tinggal Warga</div>', unsafe_allow_html=True)
+    # ── PILIHAN WILAYAH ──
+    st.markdown('<div class="section-title">📍 Wilayah Tempat Tinggal Warga</div>',
+                unsafe_allow_html=True)
 
     if role == "Admin":
+        # Admin bebas pilih semua wilayah
         col_k, col_kec, col_kel = st.columns(3)
         with col_k:
-            kota = st.selectbox(
-                "Kota/Kabupaten *",
-                ["-- Pilih --"] + list(WILAYAH_DKI.keys()),
-                key="sel_kota"
-            )
+            kota = st.selectbox("Kota/Kabupaten *",
+                ["-- Pilih --"] + list(WILAYAH_DKI.keys()), key="sel_kota")
         with col_kec:
-            if kota != "-- Pilih --":
-                kec_opts = ["-- Pilih --"] + list(WILAYAH_DKI[kota].keys())
-            else:
-                kec_opts = ["-- Pilih --"]
+            kec_opts = ["-- Pilih --"] + list(WILAYAH_DKI[kota].keys()) \
+                       if kota != "-- Pilih --" else ["-- Pilih --"]
             kecamatan = st.selectbox("Kecamatan *", kec_opts, key="sel_kecamatan")
         with col_kel:
-            if kota != "-- Pilih --" and kecamatan != "-- Pilih --":
-                kel_opts = ["-- Pilih --"] + WILAYAH_DKI[kota][kecamatan]
-            else:
-                kel_opts = ["-- Pilih --"]
+            kel_opts = ["-- Pilih --"] + WILAYAH_DKI[kota][kecamatan] \
+                       if kota != "-- Pilih --" and kecamatan != "-- Pilih --" \
+                       else ["-- Pilih --"]
             kelurahan = st.selectbox("Kelurahan *", kel_opts, key="sel_kelurahan")
 
-    else:
-        col_k, col_kec, col_kel = st.columns(3)
-        with col_k:
-            if prefill_kota:
-                st.text_input("Kota/Kabupaten", value=prefill_kota, disabled=True)
-                kota = prefill_kota
-            else:
-                kota = st.selectbox(
-                    "Kota/Kabupaten *",
-                    ["-- Pilih --"] + list(WILAYAH_DKI.keys()),
-                    key="sel_kota"
-                )
+    elif role == "Korwil":
+        # Korwil: kota terkunci, kecamatan & kelurahan bebas pilih
+        st.markdown(f"""
+        <div class="wilayah-locked">
+            🔒 Wilayah tugas Anda: <strong>{prefill_kota}</strong>
+        </div>
+        """, unsafe_allow_html=True)
+        st.markdown("")
+        kota = prefill_kota
+        col_kec, col_kel = st.columns(2)
         with col_kec:
-            if prefill_kecamatan:
-                st.text_input("Kecamatan", value=prefill_kecamatan, disabled=True)
-                kecamatan = prefill_kecamatan
-            else:
-                kec_opts = ["-- Pilih --"] + list(WILAYAH_DKI.get(kota, {}).keys()) if kota != "-- Pilih --" else ["-- Pilih --"]
-                kecamatan = st.selectbox("Kecamatan *", kec_opts, key="sel_kecamatan")
+            kec_opts = ["-- Pilih --"] + list(WILAYAH_DKI.get(kota, {}).keys())
+            kecamatan = st.selectbox("Kecamatan *", kec_opts, key="sel_kecamatan")
         with col_kel:
-            if prefill_kelurahan:
-                st.text_input("Kelurahan", value=prefill_kelurahan, disabled=True)
-                kelurahan = prefill_kelurahan
-            else:
-                kel_opts = ["-- Pilih --"] + WILAYAH_DKI.get(kota, {}).get(kecamatan, []) if kecamatan != "-- Pilih --" else ["-- Pilih --"]
-                kelurahan = st.selectbox("Kelurahan *", kel_opts, key="sel_kelurahan")
+            kel_opts = ["-- Pilih --"] + WILAYAH_DKI.get(kota, {}).get(kecamatan, []) \
+                       if kecamatan != "-- Pilih --" else ["-- Pilih --"]
+            kelurahan = st.selectbox("Kelurahan *", kel_opts, key="sel_kelurahan")
+
+    elif role == "Korcam":
+        # Korcam: kota & kecamatan terkunci, kelurahan bebas pilih
+        st.markdown(f"""
+        <div class="wilayah-locked">
+            🔒 Wilayah tugas Anda: <strong>{prefill_kota} → {prefill_kecamatan}</strong>
+        </div>
+        """, unsafe_allow_html=True)
+        st.markdown("")
+        kota = prefill_kota
+        kecamatan = prefill_kecamatan
+        kel_opts = ["-- Pilih --"] + WILAYAH_DKI.get(kota, {}).get(kecamatan, [])
+        kelurahan = st.selectbox("Kelurahan *", kel_opts, key="sel_kelurahan")
+
+    elif role == "Korkel":
+        # Korkel: kota, kecamatan & kelurahan semua terkunci
+        st.markdown(f"""
+        <div class="wilayah-locked">
+            🔒 Wilayah tugas Anda: <strong>{prefill_kota} → {prefill_kecamatan} → {prefill_kelurahan}</strong>
+        </div>
+        """, unsafe_allow_html=True)
+        st.markdown("")
+        kota      = prefill_kota
+        kecamatan = prefill_kecamatan
+        kelurahan = prefill_kelurahan
+
+    elif role == "Korgas":
+        # Korgas: semua wilayah + RW terkunci
+        st.markdown(f"""
+        <div class="wilayah-locked">
+            🔒 Wilayah tugas Anda: <strong>{prefill_kota} → {prefill_kecamatan} → {prefill_kelurahan} → RW {prefill_rw}</strong>
+        </div>
+        """, unsafe_allow_html=True)
+        st.markdown("")
+        kota      = prefill_kota
+        kecamatan = prefill_kecamatan
+        kelurahan = prefill_kelurahan
+
+    else:
+        kota = kecamatan = kelurahan = "-- Pilih --"
 
     st.markdown('<div class="custom-divider"></div>', unsafe_allow_html=True)
 
     # ── FORM DATA WARGA ──
     with st.form("form_warga", clear_on_submit=True):
-        st.markdown('<div class="section-title">👤 Data Identitas Warga</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">👤 Data Identitas Warga</div>',
+                    unsafe_allow_html=True)
         col1, col2 = st.columns(2)
         with col1:
-            nama = st.text_input("Nama Lengkap *", placeholder="Nama sesuai KTP...")
-            nik = st.text_input("NIK (16 digit) *", placeholder="3171xxxxxxxxxxxxxxxx", max_chars=16)
+            nama   = st.text_input("Nama Lengkap *", placeholder="Nama sesuai KTP...")
+            nik    = st.text_input("NIK (16 digit) *", placeholder="3171xxxxxxxxxxxxxxxx",
+                                   max_chars=16)
         with col2:
             no_telp = st.text_input("Nomor Telepon/WA", placeholder="08xxxxxxxxxx")
 
-        alamat = st.text_area("Alamat Lengkap *", placeholder="Jl. ..., RT/RW, Kelurahan, Kecamatan", height=80)
+        alamat = st.text_area("Alamat Lengkap *",
+                              placeholder="Jl. ..., RT/RW, Kelurahan, Kecamatan", height=80)
 
         col_rw, col_rt = st.columns(2)
         with col_rw:
-            rw = st.number_input("RW *", min_value=1, max_value=99, value=1)
+            # Korgas: RW terkunci sesuai wilayah tugas
+            if role == "Korgas" and prefill_rw:
+                rw_val = int(prefill_rw) if str(prefill_rw).isdigit() else 1
+                st.text_input("RW (Terkunci)", value=str(rw_val), disabled=True)
+                rw = rw_val
+            else:
+                rw = st.number_input("RW *", min_value=1, max_value=99, value=1)
         with col_rt:
             rt = st.number_input("RT *", min_value=1, max_value=99, value=1)
 
