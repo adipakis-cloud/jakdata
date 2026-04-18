@@ -645,7 +645,7 @@ def init_db():
     try:
         cur = conn.cursor()
 
-        # Tabel users
+        # Tabel users — dengan email & RT
         cur.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id SERIAL PRIMARY KEY,
@@ -653,10 +653,16 @@ def init_db():
                 password VARCHAR(255) NOT NULL,
                 nama_lengkap VARCHAR(255) NOT NULL,
                 role VARCHAR(50) NOT NULL,
+                email VARCHAR(255) DEFAULT '',
+                no_hp VARCHAR(50) DEFAULT '',
                 kota VARCHAR(100) DEFAULT '',
                 kecamatan VARCHAR(100) DEFAULT '',
                 kelurahan VARCHAR(100) DEFAULT '',
                 rw VARCHAR(20) DEFAULT '',
+                rt VARCHAR(20) DEFAULT '',
+                email_verified INTEGER DEFAULT 0,
+                ktp_status VARCHAR(20) DEFAULT 'belum',
+                ktp_catatan TEXT DEFAULT '',
                 created_at TIMESTAMP DEFAULT NOW(),
                 is_active INTEGER DEFAULT 1,
                 last_login TIMESTAMP,
@@ -665,7 +671,7 @@ def init_db():
             )
         """)
 
-        # Tabel warga
+        # Tabel warga — lengkap
         cur.execute("""
             CREATE TABLE IF NOT EXISTS warga (
                 id SERIAL PRIMARY KEY,
@@ -680,13 +686,34 @@ def init_db():
                 rt INTEGER,
                 latitude DOUBLE PRECISION,
                 longitude DOUBLE PRECISION,
+                foto_ktp_url TEXT DEFAULT '',
+                foto_ktp_status VARCHAR(20) DEFAULT 'belum',
                 diinput_oleh VARCHAR(100),
                 diinput_nama VARCHAR(255),
                 role_input VARCHAR(50),
                 kota_petugas VARCHAR(100),
                 kecamatan_petugas VARCHAR(100),
                 kelurahan_petugas VARCHAR(100),
+                rw_petugas VARCHAR(20) DEFAULT '',
+                rt_petugas VARCHAR(20) DEFAULT '',
                 created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+
+        # Tabel foto KTP warga (sementara — bisa di-download & dihapus)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS foto_ktp (
+                id SERIAL PRIMARY KEY,
+                warga_id INTEGER,
+                username_petugas VARCHAR(100),
+                foto_data TEXT,
+                foto_nama VARCHAR(255),
+                ukuran_kb INTEGER,
+                status VARCHAR(20) DEFAULT 'menunggu',
+                catatan_admin TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT NOW(),
+                downloaded_at TIMESTAMP,
+                deleted_at TIMESTAMP
             )
         """)
 
@@ -698,27 +725,37 @@ def init_db():
                 nama VARCHAR(255),
                 aksi VARCHAR(100),
                 detail TEXT,
-                ip_address VARCHAR(50),
                 created_at TIMESTAMP DEFAULT NOW()
             )
         """)
 
-        # Tambah kolom baru jika belum ada (untuk upgrade)
-        for col_sql in [
+        # Upgrade kolom existing jika belum ada
+        upgrades = [
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR(255) DEFAULT ''",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS no_hp VARCHAR(50) DEFAULT ''",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS rt VARCHAR(20) DEFAULT ''",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified INTEGER DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS ktp_status VARCHAR(20) DEFAULT 'belum'",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS ktp_catatan TEXT DEFAULT ''",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMP",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS login_attempts INTEGER DEFAULT 0",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until TIMESTAMP",
-        ]:
+            "ALTER TABLE warga ADD COLUMN IF NOT EXISTS foto_ktp_url TEXT DEFAULT ''",
+            "ALTER TABLE warga ADD COLUMN IF NOT EXISTS foto_ktp_status VARCHAR(20) DEFAULT 'belum'",
+            "ALTER TABLE warga ADD COLUMN IF NOT EXISTS rw_petugas VARCHAR(20) DEFAULT ''",
+            "ALTER TABLE warga ADD COLUMN IF NOT EXISTS rt_petugas VARCHAR(20) DEFAULT ''",
+        ]
+        for sql in upgrades:
             try:
-                cur.execute(col_sql)
+                cur.execute(sql)
             except:
                 pass
 
         # Admin default
         admin_pw = hash_password("admin123")
         cur.execute("""
-            INSERT INTO users (username, password, nama_lengkap, role)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO users (username, password, nama_lengkap, role, email_verified)
+            VALUES (%s, %s, %s, %s, 1)
             ON CONFLICT (username) DO NOTHING
         """, ("admin", admin_pw, "Administrator Provinsi DKI Jakarta", "Admin"))
 
@@ -868,7 +905,8 @@ def render_sidebar():
         nama = user.get("nama_lengkap", "-")
 
         role_colors = {
-            "Admin": "🔴", "Korwil": "🟢", "Korcam": "🔵", "Korkel": "🟠", "Korgas": "🟣"
+            "Admin": "🔴", "Korwil": "🟢", "Korcam": "🔵",
+            "Korkel": "🟠", "Korgas": "🟣", "Korrt": "🟡"
         }
         icon = role_colors.get(role, "⚪")
         st.markdown(f"**{icon} {nama}**")
@@ -1169,6 +1207,18 @@ def page_input_warga():
         kecamatan = prefill_kecamatan
         kelurahan = prefill_kelurahan
 
+    elif role == "Korrt":
+        # Korrt: semua wilayah + RW + RT terkunci
+        st.markdown(f"""
+        <div class="wilayah-locked">
+            🔒 Wilayah tugas Anda: <strong>{prefill_kota} → {prefill_kecamatan} → {prefill_kelurahan} → RW {prefill_rw} → RT {user.get('rt','')}</strong>
+        </div>
+        """, unsafe_allow_html=True)
+        st.markdown("")
+        kota      = prefill_kota
+        kecamatan = prefill_kecamatan
+        kelurahan = prefill_kelurahan
+
     else:
         kota = kecamatan = kelurahan = "-- Pilih --"
 
@@ -1191,15 +1241,19 @@ def page_input_warga():
 
         col_rw, col_rt = st.columns(2)
         with col_rw:
-            # Korgas: RW terkunci sesuai wilayah tugas
-            if role == "Korgas" and prefill_rw:
+            if role in ["Korgas", "Korrt"] and prefill_rw:
                 rw_val = int(prefill_rw) if str(prefill_rw).isdigit() else 1
                 st.text_input("RW (Terkunci)", value=str(rw_val), disabled=True)
                 rw = rw_val
             else:
                 rw = st.number_input("RW *", min_value=1, max_value=99, value=1)
         with col_rt:
-            rt = st.number_input("RT *", min_value=1, max_value=99, value=1)
+            if role == "Korrt" and user.get("rt"):
+                rt_val = int(user.get("rt")) if str(user.get("rt","")).isdigit() else 1
+                st.text_input("RT (Terkunci)", value=str(rt_val), disabled=True)
+                rt = rt_val
+            else:
+                rt = st.number_input("RT *", min_value=1, max_value=99, value=1)
 
         # GPS
         st.markdown('<div class="section-title">🗺️ Titik Koordinat GPS</div>', unsafe_allow_html=True)
@@ -1410,91 +1464,223 @@ def page_manajemen_tim():
     </div>
     """, unsafe_allow_html=True)
 
-    tab1, tab2 = st.tabs(["➕ Tambah Koordinator", "📋 Daftar Tim"])
+    tab1, tab2, tab3 = st.tabs([
+        "➕ Tambah Koordinator",
+        "📋 Daftar Tim",
+        "🔍 Verifikasi KTP Koordinator"
+    ])
 
     with tab1:
-        st.markdown('<div class="section-title">➕ Daftarkan Koordinator Baru</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">➕ Daftarkan Koordinator Baru</div>',
+                    unsafe_allow_html=True)
+
+        # Pilihan wilayah di LUAR form agar cascade bekerja
+        st.markdown("**Wilayah Tugas:**")
+        role_koor = st.selectbox("Jabatan *",
+            ["Korwil", "Korcam", "Korkel", "Korgas", "Korrt"],
+            key="role_koor_sel")
+
+        col_w1, col_w2, col_w3 = st.columns(3)
+        with col_w1:
+            kota_koor = st.selectbox("Kota *",
+                ["-- Pilih --"] + list(WILAYAH_DKI.keys()), key="kota_koor_sel")
+        with col_w2:
+            if kota_koor != "-- Pilih --" and role_koor in ["Korcam","Korkel","Korgas","Korrt"]:
+                kec_koor = st.selectbox("Kecamatan *",
+                    ["-- Pilih --"] + list(WILAYAH_DKI[kota_koor].keys()),
+                    key="kec_koor_sel")
+            else:
+                kec_koor = "-- Pilih --"
+                if role_koor != "Korwil":
+                    st.selectbox("Kecamatan *", ["-- Pilih Kota dulu --"],
+                                key="kec_koor_sel")
+        with col_w3:
+            if kota_koor != "-- Pilih --" and kec_koor != "-- Pilih --" \
+               and role_koor in ["Korkel","Korgas","Korrt"]:
+                kel_koor = st.selectbox("Kelurahan *",
+                    ["-- Pilih --"] + WILAYAH_DKI[kota_koor][kec_koor],
+                    key="kel_koor_sel")
+            else:
+                kel_koor = "-- Pilih --"
+                if role_koor in ["Korkel","Korgas","Korrt"]:
+                    st.selectbox("Kelurahan *", ["-- Pilih Kecamatan dulu --"],
+                                key="kel_koor_sel")
+
+        col_rw_sel, col_rt_sel = st.columns(2)
+        with col_rw_sel:
+            rw_koor = ""
+            if role_koor in ["Korgas", "Korrt"]:
+                rw_koor = st.text_input("Nomor RW *", placeholder="Contoh: 001",
+                                        key="rw_koor_inp")
+        with col_rt_sel:
+            rt_koor = ""
+            if role_koor == "Korrt":
+                rt_koor = st.text_input("Nomor RT *", placeholder="Contoh: 005",
+                                        key="rt_koor_inp")
+
+        st.markdown('<div class="custom-divider"></div>', unsafe_allow_html=True)
+
         with st.form("form_tambah_koordinator"):
+            st.markdown("**Data Diri Koordinator:**")
             col1, col2 = st.columns(2)
             with col1:
-                nama_koor = st.text_input("Nama Lengkap *")
-                username_koor = st.text_input("Username *", placeholder="huruf kecil, tanpa spasi")
-                password_koor = st.text_input("Password *", type="password")
+                nama_koor     = st.text_input("Nama Lengkap *")
+                email_koor    = st.text_input("Email *", placeholder="email@gmail.com")
+                no_hp_koor    = st.text_input("Nomor HP/WA *", placeholder="08xxxxxxxxxx")
             with col2:
-                role_koor = st.selectbox("Jabatan *", ["Korwil", "Korcam", "Korkel", "Korgas"])
+                username_koor = st.text_input("Username *",
+                    placeholder="pakai nomor HP atau nama unik")
+                password_koor = st.text_input("Password Awal *", type="password",
+                    placeholder="Min. 8 karakter")
 
-                # Wilayah berdasarkan role
-                kota_koor = st.selectbox("Kota/Kabupaten Tugas", ["-- Pilih --"] + list(WILAYAH_DKI.keys()))
-                kec_koor = "-- Pilih --"
-                kel_koor = "-- Pilih --"
-
-                if kota_koor != "-- Pilih --" and role_koor in ["Korcam", "Korkel", "Korgas"]:
-                    kec_koor = st.selectbox("Kecamatan Tugas", ["-- Pilih --"] + list(WILAYAH_DKI[kota_koor].keys()))
-
-                if kota_koor != "-- Pilih --" and kec_koor != "-- Pilih --" and role_koor in ["Korkel", "Korgas"]:
-                    kel_koor = st.selectbox("Kelurahan Tugas", ["-- Pilih --"] + WILAYAH_DKI[kota_koor][kec_koor])
-
-                rw_koor = ""
-                if role_koor == "Korgas":
-                    rw_koor = st.text_input("RW Tugas")
-
-            submit_koor = st.form_submit_button("✅ Daftarkan Koordinator", use_container_width=True)
+            st.info("📧 Koordinator wajib verifikasi email sebelum bisa login pertama kali.")
+            submit_koor = st.form_submit_button("✅ Daftarkan Koordinator",
+                                                use_container_width=True)
 
         if submit_koor:
             errors = []
-            if not nama_koor.strip(): errors.append("Nama Lengkap wajib diisi.")
+            if not nama_koor.strip():     errors.append("Nama Lengkap wajib diisi.")
+            if not email_koor.strip():    errors.append("Email wajib diisi.")
+            if not no_hp_koor.strip():    errors.append("Nomor HP wajib diisi.")
             if not username_koor.strip(): errors.append("Username wajib diisi.")
             if not password_koor.strip(): errors.append("Password wajib diisi.")
-            if kota_koor == "-- Pilih --": errors.append("Kota/Kabupaten wajib dipilih.")
+            if len(password_koor) < 8:    errors.append("Password minimal 8 karakter.")
+            if kota_koor == "-- Pilih --": errors.append("Kota wajib dipilih.")
+            if role_koor in ["Korcam","Korkel","Korgas","Korrt"] and kec_koor == "-- Pilih --":
+                errors.append("Kecamatan wajib dipilih.")
+            if role_koor in ["Korkel","Korgas","Korrt"] and kel_koor == "-- Pilih --":
+                errors.append("Kelurahan wajib dipilih.")
+            if role_koor in ["Korgas","Korrt"] and not rw_koor.strip():
+                errors.append("Nomor RW wajib diisi.")
+            if role_koor == "Korrt" and not rt_koor.strip():
+                errors.append("Nomor RT wajib diisi.")
 
             if errors:
                 for e in errors: st.error(f"❌ {e}")
             else:
                 ok = run_query("""
-                    INSERT INTO users (username, password, nama_lengkap, role, kota, kecamatan, kelurahan, rw)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                    INSERT INTO users
+                    (username, password, nama_lengkap, role, email, no_hp,
+                     kota, kecamatan, kelurahan, rw, rt, email_verified)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1)
                     ON CONFLICT (username) DO NOTHING
                 """, (
                     username_koor.strip().lower(),
                     hash_password(password_koor),
                     nama_koor.strip(),
                     role_koor,
+                    email_koor.strip().lower(),
+                    no_hp_koor.strip(),
                     kota_koor if kota_koor != "-- Pilih --" else "",
-                    kec_koor if kec_koor != "-- Pilih --" else "",
-                    kel_koor if kel_koor != "-- Pilih --" else "",
-                    rw_koor
+                    kec_koor  if kec_koor  != "-- Pilih --" else "",
+                    kel_koor  if kel_koor  != "-- Pilih --" else "",
+                    rw_koor.strip(),
+                    rt_koor.strip()
                 ), fetch=False)
+
                 if ok:
+                    # Tampilkan info akun
                     st.success(f"✅ Koordinator **{nama_koor}** ({role_koor}) berhasil didaftarkan!")
+                    wilayah_info = f"{kota_koor}"
+                    if kec_koor != "-- Pilih --": wilayah_info += f" → {kec_koor}"
+                    if kel_koor != "-- Pilih --": wilayah_info += f" → {kel_koor}"
+                    if rw_koor: wilayah_info += f" → RW {rw_koor}"
+                    if rt_koor: wilayah_info += f" → RT {rt_koor}"
+
+                    st.markdown(f"""
+                    <div class="wilayah-locked">
+                        📋 Akun siap dikirim ke koordinator:<br>
+                        👤 Username : <strong>{username_koor.strip().lower()}</strong><br>
+                        🔑 Password : <strong>{password_koor}</strong><br>
+                        📧 Email    : <strong>{email_koor.strip()}</strong><br>
+                        📍 Wilayah  : <strong>{wilayah_info}</strong>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    catat_log("admin", "Admin", "TAMBAH_KOORDINATOR",
+                             f"Tambah {role_koor}: {nama_koor} | {wilayah_info}")
                 else:
-                    st.error("❌ Username sudah digunakan atau terjadi kesalahan.")
+                    st.error("❌ Username sudah digunakan. Pilih username lain.")
 
     with tab2:
-        st.markdown('<div class="section-title">📋 Daftar Semua Koordinator</div>', unsafe_allow_html=True)
-        rows = run_query("""
-            SELECT u.nama_lengkap as "Nama", u.username as "Username",
-                   u.role as "Jabatan", u.kota as "Kota",
-                   u.kecamatan as "Kecamatan", u.kelurahan as "Kelurahan",
-                   u.rw as "RW", COUNT(w.id) as "Total Warga Didata",
-                   CASE WHEN u.is_active=1 THEN '✅ Aktif' ELSE '❌ Nonaktif' END as "Status",
-                   u.created_at as "Dibuat"
+        st.markdown('<div class="section-title">📋 Daftar Semua Koordinator</div>',
+                    unsafe_allow_html=True)
+
+        # Filter jabatan
+        col_f1, col_f2 = st.columns(2)
+        with col_f1:
+            filter_role = st.selectbox("Filter Jabatan",
+                ["Semua", "Korwil", "Korcam", "Korkel", "Korgas", "Korrt"])
+        with col_f2:
+            filter_kota = st.selectbox("Filter Kota",
+                ["Semua"] + list(WILAYAH_DKI.keys()))
+
+        query_tim = """
+            SELECT u.nama_lengkap as "Nama",
+                   u.username as "Username",
+                   u.email as "Email",
+                   u.no_hp as "No HP",
+                   u.role as "Jabatan",
+                   u.kota as "Kota",
+                   u.kecamatan as "Kecamatan",
+                   u.kelurahan as "Kelurahan",
+                   u.rw as "RW",
+                   u.rt as "RT",
+                   u.ktp_status as "Status KTP",
+                   COUNT(w.id) as "Warga Didata",
+                   CASE WHEN u.is_active=1
+                        THEN '✅ Aktif'
+                        ELSE '❌ Nonaktif'
+                   END as "Status",
+                   TO_CHAR(u.last_login, 'DD/MM/YY HH24:MI') as "Terakhir Login"
             FROM users u
             LEFT JOIN warga w ON u.username = w.diinput_oleh
             WHERE u.role != 'Admin'
-            GROUP BY u.id, u.nama_lengkap, u.username, u.role,
-                     u.kota, u.kecamatan, u.kelurahan, u.rw,
-                     u.is_active, u.created_at
-            ORDER BY u.role, u.kota
-        """)
+        """
+        params_tim = []
+        if filter_role != "Semua":
+            query_tim += " AND u.role=%s"
+            params_tim.append(filter_role)
+        if filter_kota != "Semua":
+            query_tim += " AND u.kota=%s"
+            params_tim.append(filter_kota)
+        query_tim += """
+            GROUP BY u.id, u.nama_lengkap, u.username, u.email,
+                     u.no_hp, u.role, u.kota, u.kecamatan,
+                     u.kelurahan, u.rw, u.rt, u.ktp_status,
+                     u.is_active, u.last_login
+            ORDER BY u.role, u.kota, u.kecamatan, u.rw, u.rt
+        """
+
+        rows = run_query(query_tim, params_tim if params_tim else None)
         df_tim = pd.DataFrame(rows) if rows else pd.DataFrame()
 
         if not df_tim.empty:
-            st.dataframe(df_tim, use_container_width=True, hide_index=True)
+            # Statistik ringkas
+            col_s1, col_s2, col_s3, col_s4 = st.columns(4)
+            jumlah_role = {
+                "Korwil": len(df_tim[df_tim["Jabatan"]=="Korwil"]),
+                "Korcam": len(df_tim[df_tim["Jabatan"]=="Korcam"]),
+                "Korkel": len(df_tim[df_tim["Jabatan"]=="Korkel"]),
+                "Korgas": len(df_tim[df_tim["Jabatan"]=="Korgas"]),
+            }
+            korrt = len(df_tim[df_tim["Jabatan"]=="Korrt"])
+            with col_s1:
+                st.metric("Korwil", jumlah_role["Korwil"])
+            with col_s2:
+                st.metric("Korcam", jumlah_role["Korcam"])
+            with col_s3:
+                st.metric("Korkel + Korgas", jumlah_role["Korkel"] + jumlah_role["Korgas"])
+            with col_s4:
+                st.metric("Korrt (RT)", korrt)
+
+            st.dataframe(df_tim, use_container_width=True, hide_index=True, height=400)
+
+            # Download Excel
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
                 df_tim.to_excel(writer, index=False, sheet_name="Tim Koordinator")
             st.download_button(
-                "📥 Download Daftar Tim",
+                "📥 Download Daftar Tim (.xlsx)",
                 data=output.getvalue(),
                 file_name=f"JAKDATA_Tim_{datetime.now().strftime('%Y%m%d')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -1502,31 +1688,66 @@ def page_manajemen_tim():
         else:
             st.info("Belum ada koordinator terdaftar.")
 
-        # Kelola status koordinator
-        st.markdown('<div class="section-title">⚙️ Kelola Status Koordinator</div>', unsafe_allow_html=True)
-        rows_u = run_query("SELECT id, nama_lengkap, username, role, is_active FROM users WHERE role != 'Admin'")
+        # Kelola Status
+        st.markdown('<div class="section-title">⚙️ Kelola Status Koordinator</div>',
+                    unsafe_allow_html=True)
+        rows_u = run_query("""
+            SELECT id, nama_lengkap, username, role, is_active, ktp_status
+            FROM users WHERE role != 'Admin' ORDER BY role, nama_lengkap
+        """)
         df_users = pd.DataFrame(rows_u) if rows_u else pd.DataFrame()
 
         if not df_users.empty:
-            col_a, col_b = st.columns([2, 1])
+            col_a, col_b, col_c = st.columns([3, 1, 1])
             with col_a:
                 sel_user = st.selectbox(
                     "Pilih Koordinator",
                     df_users["id"].tolist(),
-                    format_func=lambda x: f"{df_users[df_users['id']==x]['nama_lengkap'].values[0]} ({df_users[df_users['id']==x]['role'].values[0]})"
-                )
-            with col_b:
-                user_row = df_users[df_users["id"] == sel_user].iloc[0]
-                current_status = user_row["is_active"]
-                action_label = "❌ Nonaktifkan" if current_status == 1 else "✅ Aktifkan"
-                if st.button(action_label, use_container_width=True):
-                    new_status = 0 if current_status == 1 else 1
-                    run_query(
-                        "UPDATE users SET is_active=%s WHERE id=%s",
-                        (new_status, sel_user), fetch=False
+                    format_func=lambda x: (
+                        f"{df_users[df_users['id']==x]['nama_lengkap'].values[0]} "
+                        f"({df_users[df_users['id']==x]['role'].values[0]})"
                     )
-                    st.success("✅ Status berhasil diubah!")
-                    st.rerun()
+                )
+            if sel_user:
+                user_row = df_users[df_users["id"] == sel_user].iloc[0]
+                with col_b:
+                    current = user_row["is_active"]
+                    label = "❌ Nonaktifkan" if current == 1 else "✅ Aktifkan"
+                    if st.button(label, use_container_width=True):
+                        run_query(
+                            "UPDATE users SET is_active=%s WHERE id=%s",
+                            (0 if current == 1 else 1, sel_user), fetch=False
+                        )
+                        st.success("✅ Status diubah!")
+                        st.rerun()
+                with col_c:
+                    if st.button("🔓 Reset Password", use_container_width=True):
+                        new_pw = hash_password("jakdata123")
+                        run_query(
+                            "UPDATE users SET password=%s, login_attempts=0, locked_until=NULL WHERE id=%s",
+                            (new_pw, sel_user), fetch=False
+                        )
+                        st.success("✅ Password direset ke: jakdata123")
+
+    with tab3:
+        st.markdown('<div class="section-title">🔍 Verifikasi KTP Koordinator</div>',
+                    unsafe_allow_html=True)
+        st.info("Fitur upload & verifikasi KTP koordinator akan tersedia di sprint berikutnya.")
+
+        # Tampilkan status KTP semua koordinator
+        rows_ktp = run_query("""
+            SELECT nama_lengkap as "Nama", username as "Username",
+                   role as "Jabatan", kota as "Kota",
+                   kecamatan as "Kecamatan", kelurahan as "Kelurahan",
+                   rw as "RW", rt as "RT",
+                   ktp_status as "Status KTP",
+                   ktp_catatan as "Catatan"
+            FROM users WHERE role != 'Admin'
+            ORDER BY ktp_status, role
+        """)
+        if rows_ktp:
+            df_ktp = pd.DataFrame(rows_ktp)
+            st.dataframe(df_ktp, use_container_width=True, hide_index=True)
 
 
 # ============================================================
